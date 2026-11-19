@@ -1,0 +1,7 @@
+## IDF Component Manager Manifest File
+##
+## 板级支持包等组件已 vendor 在 ../components 下，此处只声明
+## 仍需从组件仓库解析的第三方依赖。
+dependencies:
+  espressif/esp_lcd_ek79007:
+    version: ">=2.0.1,<3.0.0"

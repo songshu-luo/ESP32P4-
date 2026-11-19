@@ -1,0 +1,89 @@
+# S0 阶段：点屏 + 触摸基线
+#
+# 目标板：ESP32-P4-Function-EV-Board V1.5.2（芯片 revision v1.3，旧版 P4）
+# 屏幕：7 英寸 1024x600，EK79007 + GT911 电容触摸
+# 基线：espressif/esp-bsp examples/display
+
+# ---- 目标与芯片 ----
+CONFIG_IDF_TARGET="esp32p4"
+
+# 本板芯片为 revision v1.3（< 3.0），不是 P4X，必须走旧版修订分支。
+# IDF v5.4 默认为 y，这里显式写死防止被误改。
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+
+# ---- Flash ----
+# 实测 16MB（C8/4018）。基线示例的 2MB 配置会限制分区表和未来固件体积。
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# 保持与官方 BSP 示例一致的启动分区布局（bootloader 0x2000 / 分区表 0x9000）。
+CONFIG_PARTITION_TABLE_OFFSET=0x9000
+# 默认 single-app-large 只给 app 1500K。16MB flash 只用 1.5MB 没有道理，
+# 改用工程内的 partitions.csv，app 放大到 4MB（nvs/phy_init 偏移保持不变）。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- PSRAM ----
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# ---- 运行配置 ----
+CONFIG_COMPILER_OPTIMIZATION_PERF=y
+CONFIG_FREERTOS_HZ=1000
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
+
+# ---- BSP 选择 ----
+CONFIG_BSP_SELECT_ESP32_P4_FUNCTION_EV_BOARD=y
+CONFIG_BSP_LCD_TYPE_1024_600=y
+
+# ---- LVGL 9 ----
+CONFIG_LV_CONF_SKIP=y
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_DEF_REFR_PERIOD=10
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_OBSERVER=y
+CONFIG_LV_USE_FLOAT=y
+CONFIG_LV_USE_GESTURE_RECOGNITION=y
+
+# 点屏阶段用于观察刷新率与 CPU 占用，正式版本可关闭。
+CONFIG_LV_USE_SYSMON=y
+CONFIG_LV_USE_PERF_MONITOR=y
+
+# 用到的字号（默认 montserrat 14 由 LVGL 自动 select）
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+CONFIG_LV_FONT_MONTSERRAT_36=y
+
+# ---- 以太网（S1）----
+# 板载 IP101GRI + RJ45，走 P4 内置 EMAC 的 RMII。BSP 不含以太网支持，
+# 由 main/eth_link.c 直接调用 esp_eth 初始化。
+CONFIG_ETH_USE_ESP32_EMAC=y
+CONFIG_ETH_PHY_INTERFACE_RMII=y
+# PSRAM 存在时 DMA 描述符放内部 RAM，缓冲区可以更大；10 个接收缓冲足够 100M 线速。
+CONFIG_ETH_DMA_BUFFER_SIZE=512
+CONFIG_ETH_DMA_RX_BUFFER_NUM=20
+CONFIG_ETH_DMA_TX_BUFFER_NUM=10
+
+# ---- MQTT 客户端（S2-a）----
+# 走泰山派 Hub 的 Mosquitto（protocol/topics-v1.md）。
+# 选 MQTT 5：Mosquitto 在 3.1.1 下对越权发布是「静默丢弃」，只有 5.0 会回
+# Not authorized；诊断信息的差别在这一阶段至关重要。
+CONFIG_MQTT_PROTOCOL_5=y
+CONFIG_MQTT_PROTOCOL_311=y
+
+# Broker 地址、端口、账号见 main/Kconfig.projbuild。
+# 密码本身不放这里：构建时用 SDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.secrets"
+# 把本地未提交的 sdkconfig.secrets 叠加上去（见 docs/S2a-MQTT接入.md）。
+CONFIG_TERMINAL_MQTT_BROKER_HOST="squirrel-lckfb.local"
+CONFIG_TERMINAL_MQTT_HOST_FALLBACK_NAME="squirrel-lckfb"
+CONFIG_TERMINAL_MQTT_HOST_FALLBACK_IP="192.168.0.156"
+CONFIG_TERMINAL_MQTT_PORT=1883
+CONFIG_TERMINAL_MQTT_CLIENT_ID="esp32-terminal"
+CONFIG_TERMINAL_MQTT_USERNAME="esp32-terminal"
+CONFIG_TERMINAL_MQTT_PASSWORD=""

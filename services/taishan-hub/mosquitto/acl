@@ -1,0 +1,27 @@
+# Mosquitto ACL v1 —— 每设备独立凭据，最小权限（方案 §10.3）
+#
+# 规则说明：
+#   - 未在下方列出的用户名，即使能登录也读写不了任何主题。
+#   - 主题必须与 protocol/topics-v1.md 完全一致；改主题先改文档。
+#
+# 安装到 /etc/taishan-hub/mosquitto.acl
+
+# ---- 泰山派指标 Agent：只能写自己的 status / metrics ----
+user taishan-agent
+topic write hub/v1/devices/taishan-3m/status
+topic write hub/v1/devices/taishan-3m/metrics
+
+# ---- ESP32 终端：只读全部设备状态，只能写命令结果回执 ----
+# 注意：ESP32 不能写 devices/*/metrics，无法伪造其他设备的数据。
+user esp32-terminal
+topic read  hub/v1/devices/#
+topic read  hub/v1/events
+topic write hub/v1/commands/results/#
+topic write hub/v1/devices/esp32-terminal/status
+topic write hub/v1/devices/esp32-terminal/metrics
+
+# ---- 人工运维：全权 + broker 自身指标 ----
+# 只应在调试时使用；长期可删。
+user ops
+topic readwrite #
+topic read      $SYS/#

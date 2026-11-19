@@ -1,0 +1,18 @@
+# 分区表（S2-d 前置：app 分区扩容）
+#
+# 背景：默认的 partitions_singleapp_large.csv 只给 app 1500K，
+# S2-c 之后固件已到 1,434,672 B，只剩 101 KB（6.6%）。
+# 板载 Flash 实测 16 MB，实际只用了 1.5 MB，没有理由把 app 卡在 1500K。
+#
+# 约定：
+#   - nvs / phy_init 的偏移与原来逐字节一致，扩容是纯增量，不动任何已存数据。
+#   - factory 从 0x20000 开始，与烧录地址一致（见 docs/烧录指令.md）。
+#   - 4 MB 给 app 之后，Flash 仍剩 ~11.7 MB 未分配，S5/S6 需要再加分区时随便加。
+#
+# 注意：改了这张表就要把 partition-table.bin 一起重烧，只烧 app 会让 bootloader
+# 按旧表校验，报 app image 越界。
+
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0xa000,   0x6000,
+phy_init,   data, phy,     0x10000,  0x1000,
+factory,    app,  factory, 0x20000,  4M,

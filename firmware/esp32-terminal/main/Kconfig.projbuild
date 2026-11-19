@@ -1,0 +1,49 @@
+menu "Terminal MQTT (S2)"
+
+    config TERMINAL_MQTT_BROKER_HOST
+        string "Broker mDNS hostname"
+        default "squirrel-lckfb.local"
+        help
+            Primary broker address. lwIP resolves names ending in ".local" with a
+            one-shot multicast mDNS query (CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES),
+            so no espressif/mdns component is needed.
+
+    config TERMINAL_MQTT_HOST_FALLBACK_NAME
+        string "Fallback hostname (router DHCP name)"
+        default "squirrel-lckfb"
+        help
+            Tried if the mDNS name does not resolve. The router registers DHCP
+            client hostnames in its local DNS.
+
+    config TERMINAL_MQTT_HOST_FALLBACK_IP
+        string "Fallback IP (last resort)"
+        default "192.168.0.156"
+        help
+            Tried if neither name resolves. This is the DHCP address the Taishan Pi
+            currently holds; do a DHCP reservation on the router before relying on it.
+
+    config TERMINAL_MQTT_PORT
+        int "Broker port"
+        default 1883
+        help
+            Plain MQTT, LAN only. TLS (8883) is a later stage.
+
+    config TERMINAL_MQTT_CLIENT_ID
+        string "MQTT client id"
+        default "esp32-terminal"
+        help
+            Must match the device_id used in protocol/topics-v1.md.
+
+    config TERMINAL_MQTT_USERNAME
+        string "MQTT username"
+        default "esp32-terminal"
+
+    config TERMINAL_MQTT_PASSWORD
+        string "MQTT password"
+        default ""
+        help
+            Comes from /etc/taishan-hub/credentials.env (ESP32_PASS) on the hub.
+            Stored in sdkconfig.defaults on purpose (no NVS provisioning step yet).
+            Never commit a build containing this value to a public repository.
+
+endmenu

@@ -1,0 +1,15 @@
+# 仓库根 .gitignore —— 只放「跨项目通用」的规则，
+# ESP-IDF 相关的忽略规则在 firmware/esp32-terminal/.gitignore 里。
+
+# Claude Code 个人本地设置（权限允许列表随机器走，不进库）
+.claude/settings.local.json
+
+# CodeArts 本地状态
+.codeartsdoer/
+
+# 凭据类文件一律不进库（真实值只存在于目标机本地）
+*.secrets
+credentials.env
+mosquitto.passwd
+*.pem
+*.key

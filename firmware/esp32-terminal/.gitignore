@@ -1,0 +1,19 @@
+# 构建与烧录产物（二进制、sdkconfig 等）不入库
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock.bak
+managed_components/
+
+# 字体生成工具的本地缓存（lv_font_conv，约 2 MB，首次运行自动重装）
+tools/.cache/
+
+# 本地密钥：MQTT 密码等，绝不能提交
+sdkconfig.secrets
+*.secrets
+
+# 构建中间产物
+*.o
+*.a
+*.elf
+*.map
