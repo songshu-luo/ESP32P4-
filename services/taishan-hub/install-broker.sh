@@ -6,7 +6,7 @@
 #
 # 做什么：
 #   1. 建 /etc/taishan-hub（root:mosquitto 750）
-#   2. 生成三个账号的随机密码，写入 credentials.env（root 600）
+#   2. 生成四个账号的随机密码，写入 credentials.env（root 600）
 #   3. 写 mosquitto.passwd / mosquitto.acl
 #   4. 安装 conf.d/taishan-hub.conf
 #   5. 重启并验证：匿名被拒、taishan-agent 可发、esp32-terminal 只读
@@ -32,9 +32,9 @@ msg "1/6 准备目录"
 # mosquitto.passwd / acl 属主 mosquitto 且 600/640。
 install -d -m 755 -o root -g root "$HUB_DIR"
 
-msg "2/6 生成凭据（已存在则保留，不覆盖）"
+msg "2/6 生成凭据（已存在则保留，缺的补上）"
+gen() { openssl rand -base64 24 | tr -d '/+=' | cut -c1-20; }
 if [ ! -f "$CRED" ]; then
-  gen() { openssl rand -base64 24 | tr -d '/+=' | cut -c1-20; }
   cat > "$CRED" <<EOF
 # 泰山派 Hub 设备凭据 —— 仅本机 root 可读，禁止提交到仓库
 MOSQUITTO_HOST=192.168.0.156
@@ -43,6 +43,8 @@ TAISHAN_AGENT_USER=taishan-agent
 TAISHAN_AGENT_PASS=$(gen)
 ESP32_USER=esp32-terminal
 ESP32_PASS=$(gen)
+WINDOWS_AGENT_USER=windows-agent
+WINDOWS_AGENT_PASS=$(gen)
 OPS_USER=ops
 OPS_PASS=$(gen)
 EOF
@@ -53,6 +55,19 @@ else
   echo "沿用已有凭据：$CRED"
   chown root:lckfb "$CRED"; chmod 640 "$CRED"
 fi
+
+# 后加的设备凭据：S1 时代生成的 credentials.env 里没有 windows-agent 这一组。
+# 缺哪个补哪个，已存在的一律不覆盖——覆盖会把正在用的密码换掉，
+# 表现为「agent 突然连不上」，而密码本身并不需要变。
+append_cred() {   # $1=变量名  $2=固定值（空串表示随机生成）
+  local key=$1 fixed=$2 value
+  grep -q "^${key}=" "$CRED" && return 0
+  if [ -n "$fixed" ]; then value=$fixed; else value=$(gen); fi
+  printf '%s=%s\n' "$key" "$value" >> "$CRED"
+  echo "已补充 $key"
+}
+append_cred WINDOWS_AGENT_USER windows-agent
+append_cred WINDOWS_AGENT_PASS ""
 
 # shellcheck disable=SC1090
 . "$CRED"
@@ -66,6 +81,7 @@ PW_TMP=$HUB_DIR/.mosquitto.passwd.tmp
 install -m 600 -o root -g root /dev/null "$PW_TMP"
 mosquitto_passwd -c -b "$PW_TMP" "$TAISHAN_AGENT_USER" "$TAISHAN_AGENT_PASS"
 mosquitto_passwd    -b "$PW_TMP" "$ESP32_USER"        "$ESP32_PASS"
+mosquitto_passwd    -b "$PW_TMP" "$WINDOWS_AGENT_USER" "$WINDOWS_AGENT_PASS"
 mosquitto_passwd    -b "$PW_TMP" "$OPS_USER"          "$OPS_PASS"
 install -m 600 -o mosquitto -g mosquitto "$PW_TMP" "$HUB_DIR/mosquitto.passwd"
 rm -f "$PW_TMP"
@@ -141,6 +157,23 @@ else
   exit 1
 fi
 rm -f /tmp/_mq_cap.txt
+
+# 6e windows-agent 只能写自己的主题，不能写 taishan-3m 的。
+if out=$(timeout 5 mosquitto_pub -V mqttv5 -h "$HOST" -u "$WINDOWS_AGENT_USER" -P "$WINDOWS_AGENT_PASS" \
+     -t hub/v1/devices/windows-main/metrics -m '{"probe":3}' 2>&1); [ -n "$out" ]; then
+  echo "[FAIL] windows-agent 发布报错：$out"
+  exit 1
+fi
+echo "[OK] windows-agent 可发布自己的 metrics"
+
+out=$(timeout 5 mosquitto_pub -V mqttv5 -h "$HOST" -u "$WINDOWS_AGENT_USER" -P "$WINDOWS_AGENT_PASS" \
+     -t hub/v1/devices/taishan-3m/metrics -m '{"probe":4}' -q 1 2>&1 || true)
+if echo "$out" | grep -qi 'not authorized'; then
+  echo "[OK] windows-agent 越权写被拒（ACL 生效）"
+else
+  echo "[FAIL] windows-agent 越权写居然成功，ACL 没生效！输出：${out:-<空>}"
+  exit 1
+fi
 
 cat <<EOF
 

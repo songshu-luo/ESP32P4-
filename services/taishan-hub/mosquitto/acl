@@ -11,6 +11,12 @@ user taishan-agent
 topic write hub/v1/devices/taishan-3m/status
 topic write hub/v1/devices/taishan-3m/metrics
 
+# ---- Windows 11 指标 Agent：只能写自己的 status / metrics ----
+# 与 taishan-agent 同权同构，主题里换成 windows-main；两台设备互相写不了。
+user windows-agent
+topic write hub/v1/devices/windows-main/status
+topic write hub/v1/devices/windows-main/metrics
+
 # ---- ESP32 终端：只读全部设备状态，只能写命令结果回执 ----
 # 注意：ESP32 不能写 devices/*/metrics，无法伪造其他设备的数据。
 user esp32-terminal

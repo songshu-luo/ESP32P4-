@@ -13,3 +13,6 @@ credentials.env
 mosquitto.passwd
 *.pem
 *.key
+# 各 Agent 的本地配置（含真实 MQTT 密码）
+**/windows-agent.env
+**/*agent.env.bak

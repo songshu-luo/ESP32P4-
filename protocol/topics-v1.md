@@ -148,6 +148,7 @@ LWT（Broker 代发）固定为：
 | 用户名 | 用途 | 权限 |
 |---|---|---|
 | `taishan-agent` | 泰山派 Agent 发布者 | 只能写 `hub/v1/devices/taishan-3m/{status,metrics}` |
+| `windows-agent` | Windows 主机 Agent 发布者 | 只能写 `hub/v1/devices/windows-main/{status,metrics}` |
 | `esp32-terminal` | ESP32 终端订阅者 | 读 `hub/v1/devices/#`、`hub/v1/events`；写 `hub/v1/commands/results/#` |
 | `ops` | 人工运维调试 | 读写全部 + 读 `$SYS/#` |
 
