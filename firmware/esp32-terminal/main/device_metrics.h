@@ -1,5 +1,5 @@
 /*
- * 泰山派 3M 指标（S2-b）
+ * 泰山派 3M 指标（S2-b，S2-d 扩展到监控页字段）
  *
  * 只负责一件事：把 hub/v1/devices/taishan-3m/metrics 的 JSON 解析成一份
  * 供 UI 读的只读快照。不做任何显示逻辑，也不做缓存归档。
@@ -19,6 +19,26 @@
 
 #include "esp_err.h"
 
+/* 上屏数量上限：RK3576 实测 6 个温区，服务一般 1~3 个。
+ * 上限比实际需求略大，解析层不做静默截断以外的假设（超出的部分会被丢弃并计数）。 */
+#define DEVICE_METRICS_MAX_ZONES    (8)
+#define DEVICE_METRICS_MAX_SERVICES (8)
+
+/* 名字长度上限：最长的温区类型是 "little-core-thermal"（19 字节），留 1 字节结尾 */
+#define DEVICE_METRICS_NAME_LEN     (24)
+
+/** 一个温区：name 是 thermal_zone 的 type 原文，例如 soc-thermal */
+typedef struct {
+    char   name[DEVICE_METRICS_NAME_LEN];
+    double celsius;
+} device_metrics_zone_t;
+
+/** 一个 systemd 服务：state 是 ActiveState 原文，例如 active / failed */
+typedef struct {
+    char name[DEVICE_METRICS_NAME_LEN];
+    char state[16];
+} device_metrics_service_t;
+
 typedef struct {
     bool     valid;              /*!< 至少成功解析过一帧 */
     uint32_t frame_count;        /*!< 成功解析的帧数，用于判断是否在刷新 */
@@ -37,21 +57,30 @@ typedef struct {
     double   mem_percent;
     double   mem_used_bytes;
     double   mem_total_bytes;
+    bool     has_swap;
+    double   swap_used_percent;  /*!< 没有 swap 分区时协议给 null → has_swap=false */
 
     /* temperature */
     bool     has_soc;
     double   soc_celsius;
     bool     has_soc_max;
     double   soc_max_celsius;
-    int      temp_zone_count;
+    int      temp_zone_count;    /*!< zones 对象里数值项的实际个数（可能大于 zones_len） */
+    int      zones_len;          /*!< zones[] 里实际存下的条数，最多 DEVICE_METRICS_MAX_ZONES */
+    device_metrics_zone_t zones[DEVICE_METRICS_MAX_ZONES];
 
     /* disk */
     bool     has_disk;
     double   disk_percent;
     double   disk_used_bytes;
     double   disk_total_bytes;
+    char     disk_path[DEVICE_METRICS_NAME_LEN];  /*!< 空串 = 未上报 */
 
-    /* 其他（S2-b 暂不上屏，留给后面的监控页） */
+    /* systemd 服务 */
+    int      services_len;       /*!< services[] 里实际存下的条数 */
+    device_metrics_service_t services[DEVICE_METRICS_MAX_SERVICES];
+
+    /* 其他 */
     bool     has_uptime;
     uint32_t uptime_seconds;
 

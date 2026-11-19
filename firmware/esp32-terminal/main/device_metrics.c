@@ -58,6 +58,32 @@ static bool get_number_in(const cJSON *root, const char *parent, const char *key
     return get_number(obj, key, out);
 }
 
+/** 取字符串字段；非字符串或超长都返回 false（超长宁可丢弃，不截断成另一个名字） */
+static bool get_string(const cJSON *obj, const char *key, char *out, size_t len)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
+    if (!cJSON_IsString(item) || item->valuestring == NULL) {
+        return false;
+    }
+    const size_t n = strlen(item->valuestring);
+    if (n == 0 || n >= len) {
+        return false;
+    }
+    memcpy(out, item->valuestring, n + 1);
+    return true;
+}
+
+/** 取嵌套对象的字符串字段 */
+static bool get_string_in(const cJSON *root, const char *parent,
+                          const char *key, char *out, size_t len)
+{
+    const cJSON *obj = cJSON_GetObjectItemCaseSensitive(root, parent);
+    if (!cJSON_IsObject(obj)) {
+        return false;
+    }
+    return get_string(obj, key, out, len);
+}
+
 /** 统计 temperature.zones 里的温区数量（协议里是个对象，不是数组） */
 static int count_zones(const cJSON *root)
 {
@@ -76,6 +102,77 @@ static int count_zones(const cJSON *root)
         }
     }
     return n;
+}
+
+/**
+ * 把 temperature.zones 这个 { "soc-thermal": 46.5, ... } 对象摊平成数组。
+ *
+ * 只保留数值项；名字按 thermal_zone 的 type 原样保留（LCD 上会显示成
+ * soc-thermal / bigcore-thermal …）。超出 DEVICE_METRICS_MAX_ZONES 的部分丢弃，
+ * temp_zone_count 仍然记录真实总数，UI 可以据此提示「还有 N 个温区未显示」。
+ */
+static int flatten_zones(const cJSON *root, device_metrics_t *dst)
+{
+    const cJSON *temp = cJSON_GetObjectItemCaseSensitive(root, "temperature");
+    if (!cJSON_IsObject(temp)) {
+        return 0;
+    }
+    const cJSON *zones = cJSON_GetObjectItemCaseSensitive(temp, "zones");
+    if (!cJSON_IsObject(zones)) {
+        return 0;
+    }
+    int stored = 0;
+    for (const cJSON *z = zones->child; z != NULL; z = z->next) {
+        if (!cJSON_IsNumber(z) || z->string == NULL) {
+            continue;
+        }
+        const size_t n = strlen(z->string);
+        if (n == 0 || n >= DEVICE_METRICS_NAME_LEN) {
+            continue;
+        }
+        if (stored >= DEVICE_METRICS_MAX_ZONES) {
+            continue;   /* 继续遍历只为数数，写入已经满了 */
+        }
+        memcpy(dst->zones[stored].name, z->string, n + 1);
+        dst->zones[stored].celsius = z->valuedouble;
+        stored++;
+    }
+    return stored;
+}
+
+/**
+ * 把 services 这个 { "mosquitto": "active", ... } 对象摊平成数组。
+ * 只保留字符串值；名字按配置里的单元名原样保留。
+ */
+static int flatten_services(const cJSON *root, device_metrics_t *dst)
+{
+    const cJSON *services = cJSON_GetObjectItemCaseSensitive(root, "services");
+    if (!cJSON_IsObject(services)) {
+        return 0;
+    }
+    int stored = 0;
+    for (const cJSON *s = services->child; s != NULL; s = s->next) {
+        if (!cJSON_IsString(s) || s->string == NULL || s->valuestring == NULL) {
+            continue;
+        }
+        const size_t n = strlen(s->string);
+        if (n == 0 || n >= DEVICE_METRICS_NAME_LEN) {
+            continue;
+        }
+        if (stored >= DEVICE_METRICS_MAX_SERVICES) {
+            continue;
+        }
+        memcpy(dst->services[stored].name, s->string, n + 1);
+        /* 状态只有 active/inactive/failed/… 几个短词；超长说明协议变了，按 unknown 处理 */
+        const size_t m = strlen(s->valuestring);
+        if (m > 0 && m < sizeof(dst->services[stored].state)) {
+            memcpy(dst->services[stored].state, s->valuestring, m + 1);
+        } else {
+            memcpy(dst->services[stored].state, "unknown", sizeof("unknown"));
+        }
+        stored++;
+    }
+    return stored;
 }
 
 /* ------------------------------------------------------------ 解析 */
@@ -125,6 +222,11 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
         get_number_in(payload, "memory", "used_bytes", &dst->mem_used_bytes);
         get_number_in(payload, "memory", "total_bytes", &dst->mem_total_bytes);
     }
+    /* swap 单独判定：没有 swap 分区时协议给 null，此时不要显示成 0% */
+    dst->has_swap = get_number_in(payload, "memory", "swap_used_percent", &v);
+    if (dst->has_swap) {
+        dst->swap_used_percent = v;
+    }
 
     /* ---- temperature ---- */
     dst->has_soc = get_number_in(payload, "temperature", "soc_celsius", &v);
@@ -135,6 +237,7 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
     if (dst->has_soc_max) {
         dst->soc_max_celsius = v;
     }
+    dst->zones_len = flatten_zones(payload, dst);
     dst->temp_zone_count = count_zones(payload);
 
     /* ---- disk ---- */
@@ -144,6 +247,10 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
         get_number_in(payload, "disk", "used_bytes", &dst->disk_used_bytes);
         get_number_in(payload, "disk", "total_bytes", &dst->disk_total_bytes);
     }
+    get_string_in(payload, "disk", "path", dst->disk_path, sizeof(dst->disk_path));
+
+    /* ---- systemd 服务 ---- */
+    dst->services_len = flatten_services(payload, dst);
 
     /* ---- uptime ---- */
     dst->has_uptime = get_number(payload, "uptime_seconds", &v);
@@ -222,7 +329,6 @@ void device_metrics_on_message(const char *topic, int topic_len,
                  (unsigned)next.frame_count, cpu, mem, soc, disk);
     }
 }
-
 void device_metrics_get(device_metrics_t *out)
 {
     if (out == NULL) {
