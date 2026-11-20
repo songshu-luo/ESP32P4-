@@ -36,14 +36,19 @@ from metrics import (
     CpuSample,
     clock_synced,
     cpu_usage_percent,
+    derive_procnet,
     local_ip_addresses,
     read_core_count,
     read_cpu_sample,
     read_disk,
+    read_disks,
+    read_gpu,
     read_memory,
+    read_physical_cores,
     read_services,
     read_temperatures,
     read_uptime_seconds,
+    sample_procnet,
 )
 
 LOG = logging.getLogger("windows-agent")
@@ -70,13 +75,25 @@ class MetricCache:
         self._cfg = cfg
         self._last: dict[str, float] = {}
         self._cpu_prev: Optional[CpuSample] = None
+        # 物理核数不会变，开机读一次就够；读不到时退化成 None，屏幕上只显示线程数
+        self._physical_cores: Optional[int] = read_physical_cores()
+        # 进程 CPU 与网速都是累计值差分，必须留着上一份原始快照
+        self._procnet_prev: Optional[dict[str, Any]] = None
         self._cache: dict[str, Any] = {
             "cpu": {"usage_percent": None, "load1": None, "load5": None,
-                    "load15": None, "cores": read_core_count()},
+                    "load15": None, "cores": read_core_count(),
+                    "physical_cores": self._physical_cores},
             "memory": {},
             "temperature": {},
             "disk": {},
             "services": {},
+            # GPU 每 5 s 刷一次；没有独显时这里会一直是全 null 的占位
+            "gpu": {},
+            # 进程 / 网速（10 s）、分区列表（30 s）
+            "processes": [],
+            "process_count": None,
+            "network": {"rx_bytes_per_sec": None, "tx_bytes_per_sec": None},
+            "disks": [],
         }
 
     def _due(self, key: str, interval: float, now: float) -> bool:
@@ -96,6 +113,7 @@ class MetricCache:
                 # Windows 没有 loadavg；协议允许字段为 null，不能拿 0 冒充
                 "load1": None, "load5": None, "load15": None,
                 "cores": read_core_count(),
+                "physical_cores": self._physical_cores,
             }
             self._cpu_prev = cur
 
@@ -112,6 +130,22 @@ class MetricCache:
             services = read_services(cfg.service_names)
             # 一个都没查到时给空对象；屏幕会显示「未上报」，不会显示 0 个在跑
             self._cache["services"] = services
+
+        if self._due("gpu", cfg.gpu_interval, now):
+            self._cache["gpu"] = read_gpu()
+
+        if self._due("procnet", cfg.procnet_interval, now):
+            sample = sample_procnet()
+            derived = derive_procnet(
+                self._procnet_prev, sample, read_core_count() or 1
+            )
+            self._cache["processes"] = derived["processes"]
+            self._cache["process_count"] = derived["process_count"]
+            self._cache["network"] = derived["network"]
+            self._procnet_prev = sample
+
+        if self._due("disks", cfg.disks_interval, now):
+            self._cache["disks"] = read_disks()
 
     def snapshot(self) -> dict[str, Any]:
         payload = dict(self._cache)

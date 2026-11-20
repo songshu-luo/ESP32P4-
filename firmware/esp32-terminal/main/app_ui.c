@@ -7,6 +7,7 @@
  *   S2-b：泰山派真实指标大卡
  *   S2-c：在线状态灯（在线 / 离线 / 过期 / 未知）
  *   S2-d：顶部常驻状态栏 + 三个页面（总览 / 监控 / 设置）
+ *   S2-e：多设备——状态灯变成「所有设备」的综合结论，总览页逐设备出卡
  *
  * 本文件只负责「跨页面」的东西：顶部状态栏、页签、定时器。
  * 各页面的内容在 ui_page_overview.c / ui_page_monitor.c（以及后续的设置页）里构建。
@@ -27,12 +28,13 @@
 
 #include <stdio.h>
 
+#include "device_registry.h"
 #include "device_status.h"
 #include "mqtt_link.h"
 
 #include "fonts/cjk_fonts.h"
 
-#define APP_VERSION     "0.5.3-s2d"
+#define APP_VERSION     "0.5.5-s2e"
 
 /* 在线状态轮询周期（ms）：status 5 s 一条、有效期 15 s，500 ms 足够 */
 #define STATUS_POLL_PERIOD_MS   (500)
@@ -43,6 +45,10 @@ typedef struct {
 } page_def_t;
 
 app_ui_ctx_t s_ctx;
+
+/* 监控页当前显示的设备槽位（◀ ▶ 按钮改它，监控页轮询回调读它）。
+ * 初始 0：泰山派通常是最先上报的设备，开机就能看到它的详细数据。 */
+int s_mon_slot = 0;
 
 /* 页面顺序即页签顺序。
  * 控制页已按需求去掉——这块板子现在只负责「看」，不提供任何控制入口。 */
@@ -112,7 +118,7 @@ lv_obj_t *ui_label(lv_obj_t *parent, const lv_font_t *font,
 /**
  * 常驻在三个页面之上的一行：
  *
- *   ● 在线   总览                          固件 0.5.2-s2d
+ *   ● 在线   总览                          固件 0.5.4-s2e
  *
  * 状态灯从 S2-c 的指标区挪到这里——它描述的是「链路和设备」，不属于某一页。
  * clock_synced=false 时中间会出现一行黄色提示（协议 §4.1 要求）。
@@ -139,12 +145,12 @@ static void build_status_bar(lv_obj_t *scr)
     s_ctx.lbl_status = ui_label(bar, &lv_font_cjk_20, COLOR_MUTED, "未知");
     lv_obj_set_pos(s_ctx.lbl_status, 48, 14);
 
-    /* 设备名固定是 taishan-3m（主题写死），所以这里不需要跟随快照刷新 */
+    /* 这里只显示当前页面名；设备名在总览页的卡片和监控页页头里 */
     s_ctx.lbl_page = ui_label(bar, &lv_font_cjk_20, COLOR_ACCENT, PAGES[0].name);
     lv_obj_set_pos(s_ctx.lbl_page, 132, 14);
 
     s_ctx.lbl_clock_warn = ui_label(bar, &lv_font_cjk_16, COLOR_WARN,
-                                    "该设备时间未同步，过期判断不可信");
+                                    "有设备时间未同步，过期判断不可信");
     lv_obj_set_pos(s_ctx.lbl_clock_warn, 216, 18);
     lv_obj_add_flag(s_ctx.lbl_clock_warn, LV_OBJ_FLAG_HIDDEN);
 
@@ -237,16 +243,19 @@ static void build_pages(lv_obj_t *scr)
 /* ---------------------------------------------------------------- 在线状态灯 */
 
 /**
- * 三态判定，严格按 protocol/topics-v1.md §3 的优先级：
+ * 三态判定，严格按 protocol/topics-v1.md §3 的优先级。
+ * S2-e 起不再只看一台设备，而是把所有已接入设备汇总成一个结论：
  *
  *   1. Hub 不可达（MQTT 没连上）      → 未知，绝不沿用上次的绿色
- *   2. status 报了 online 且没过期     → 在线
- *   3. status 报了 offline（LWT）      → 离线
- *   4. 曾经 online 但超时              → 过期
- *   5. 从没收到过                      → 未知
+ *   2. 一台设备都没接入                → 等待设备
+ *   3. 有任何一台报 offline（LWT）      → N 台离线（红）
+ *   4. 所有设备都 online 且没过期       → 在线（绿）
+ *   5. 有设备心跳超时                  → N 台过期（黄）
+ *   6. 其余（收到过但状态不认识）       → 未知
  *
  * 第 1 条是重点：broker 挂了以后，最后一条 retained 的 online 还躺在那里，
  * 只看消息的话灯会一直绿着——这正是要避免的「假在线」。
+ * 「全部在线才绿」也是同一个道理：有一台断了就不该给人「都没事」的印象。
  */
 static void status_poll_cb(lv_timer_t *timer)
 {
@@ -255,8 +264,30 @@ static void status_poll_cb(lv_timer_t *timer)
     mqtt_link_status_t link;
     mqtt_link_get_status(&link);
 
-    device_status_t s;
-    device_status_get(&s);
+    const int count = device_registry_count();
+
+    int online = 0;
+    int offline = 0;
+    int expired = 0;
+    int unknown = 0;
+    bool clock_untrusted = false;
+
+    for (int slot = 0; slot < count; slot++) {
+        device_status_t s;
+        device_status_get(slot, &s);
+        if (!s.ever_received) {
+            unknown++;
+            continue;
+        }
+        switch (s.state) {
+        case DEVICE_STATUS_ONLINE:  online++;  break;
+        case DEVICE_STATUS_OFFLINE: offline++; break;
+        default:                    expired++; break;   /* 收到过但已超时 */
+        }
+        if (s.has_clock_flag && !s.clock_synced) {
+            clock_untrusted = true;
+        }
+    }
 
     const char *text;
     lv_color_t  color;
@@ -264,14 +295,17 @@ static void status_poll_cb(lv_timer_t *timer)
     if (link.state != MQTT_LINK_ONLINE) {
         text  = "未知";
         color = COLOR_MUTED;
-    } else if (s.state == DEVICE_STATUS_ONLINE) {
+    } else if (count == 0) {
+        text  = "等待设备";
+        color = COLOR_MUTED;
+    } else if (offline > 0) {
+        text  = NULL;   /* 下面按数量格式化 */
+        color = COLOR_ERR;
+    } else if (online == count) {
         text  = "在线";
         color = COLOR_OK;
-    } else if (s.state == DEVICE_STATUS_OFFLINE) {
-        text  = "离线";
-        color = COLOR_ERR;
-    } else if (s.expired) {
-        text  = "过期";
+    } else if (expired > 0) {
+        text  = NULL;
         color = COLOR_WARN;
     } else {
         text  = "未知";
@@ -279,15 +313,19 @@ static void status_poll_cb(lv_timer_t *timer)
     }
 
     lv_obj_set_style_bg_color(s_ctx.lamp, color, 0);
-    lv_label_set_text(s_ctx.lbl_status, text);
+    if (text != NULL) {
+        lv_label_set_text(s_ctx.lbl_status, text);
+    } else if (offline > 0) {
+        lv_label_set_text_fmt(s_ctx.lbl_status, "%d 台离线", offline);
+    } else {
+        lv_label_set_text_fmt(s_ctx.lbl_status, "%d 台过期", expired);
+    }
     lv_obj_set_style_text_color(s_ctx.lbl_status, color, 0);
 
     /* 协议 §4.1：设备报 clock_synced=false 时订阅方必须提示时间不可信。
-     * 只在链路通、且确实收到过带该字段的帧时才提示——链路断开时
+     * 只在链路通、且确实有设备报了该字段为 false 时才提示——链路断开时
      * 「时间未同步」会让状态栏同时出现两个警告，反而看不出重点。 */
-    const bool clock_untrusted = (link.state == MQTT_LINK_ONLINE) &&
-                                 s.has_clock_flag && !s.clock_synced;
-    if (clock_untrusted) {
+    if (link.state == MQTT_LINK_ONLINE && clock_untrusted) {
         lv_obj_remove_flag(s_ctx.lbl_clock_warn, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_ctx.lbl_clock_warn, LV_OBJ_FLAG_HIDDEN);

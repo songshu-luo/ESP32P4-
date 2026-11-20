@@ -5,7 +5,8 @@
  *   S0 屏幕点亮 + GT911 触摸 + 背光
  *   S1 以太网（IP101GRI / EMAC RMII）后台启动并显示 DHCP 地址
  *   S2-a MQTT 接入：解析 squirrel-lckfb.local → 连接 → 订阅
- *   S2-b 把 hub/v1/devices/taishan-3m/metrics 解析成屏幕上的指标卡
+ *   S2-b 把 hub/v1/devices/{id}/metrics 解析成屏幕上的指标卡
+ *   S2-e 多设备：device_registry 槽位表，总览页逐设备显示
  *
  * 不依赖 PC，符合方案 §6.3「启动不得阻塞在网络」：
  * 网络与 MQTT 在独立任务里初始化，主流程只负责把 UI 建好。
@@ -22,6 +23,7 @@
 
 #include "app_ui.h"
 #include "device_metrics.h"
+#include "device_registry.h"
 #include "device_status.h"
 #include "eth_link.h"
 #include "mqtt_link.h"
@@ -94,18 +96,21 @@ void app_main(void)
     /* MQTT 也自己等以太网就绪，所以这里紧接着启动即可，不会互相阻塞 */
     err = mqtt_link_start_async();
     if (err == ESP_OK) {
-        /* 两个解析器都必须在 MQTT 开始收包之前就绪：
+        /* 三个模块都必须在 MQTT 开始收包之前就绪：
+         * registry 先分配槽位表，metrics/status 才能把消息按槽位存放；
          * on_message 在未初始化时会直接丢弃消息，而不是缓存。 */
+        const esp_err_t r_err = device_registry_init();
         const esp_err_t m_err = device_metrics_init();
         const esp_err_t s_err = device_status_init();
-        if (m_err != ESP_OK || s_err != ESP_OK) {
-            ESP_LOGE(TAG, "parser init failed: metrics=%s status=%s",
-                     esp_err_to_name(m_err), esp_err_to_name(s_err));
-            err = (m_err != ESP_OK) ? m_err : s_err;
+        if (r_err != ESP_OK || m_err != ESP_OK || s_err != ESP_OK) {
+            ESP_LOGE(TAG, "parser init failed: registry=%s metrics=%s status=%s",
+                     esp_err_to_name(r_err), esp_err_to_name(m_err),
+                     esp_err_to_name(s_err));
+            err = (r_err != ESP_OK) ? r_err : (m_err != ESP_OK) ? m_err : s_err;
         } else {
             mqtt_link_add_data_cb(device_metrics_on_message);
             mqtt_link_add_data_cb(device_status_on_message);
-            ESP_LOGI(TAG, "parsers ready: metrics + status hooked to mqtt data events");
+            ESP_LOGI(TAG, "parsers ready: registry + metrics + status hooked to mqtt data events");
         }
     }
     if (err != ESP_OK) {
@@ -114,5 +119,5 @@ void app_main(void)
         ESP_LOGI(TAG, "mqtt link starting in background");
     }
 
-    ESP_LOGI(TAG, "S2-c status lamp ready - backlight %d%%", APP_BACKLIGHT_PERCENT);
+    ESP_LOGI(TAG, "S2-e multi-device ready - backlight %d%%", APP_BACKLIGHT_PERCENT);
 }

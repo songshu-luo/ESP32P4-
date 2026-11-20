@@ -3,6 +3,9 @@
  *
  * 拆分原因：S2-d 加入顶部状态栏和三个页面后，app_ui.c 会超过 800 行。
  * 这里集中放配色、控件句柄和跨文件辅助函数声明。
+ *
+ * S2-e：总览页从「一张设备的四张指标卡」改成「每设备一张摘要卡」，
+ * 卡片控件改成按槽位的数组。槽位上限与 device_registry 一致（4）。
  */
 
 #pragma once
@@ -13,22 +16,23 @@
 
 #include "lvgl.h"
 
+/* 与 DEVICE_REGISTRY_MAX_DEVICES 保持一致；UI 层不 include registry 头，
+ * 只用同一个数字，改了那边记得同步这里（有编译期一致性靠不了编译器，靠约定）。 */
+#define UI_DEVICE_SLOTS (4)
+
 typedef struct {
     /* ---------- 顶部常驻状态栏 ---------- */
     lv_obj_t *lamp;
-    lv_obj_t *lbl_status;      /* 在线 / 离线 / 过期 / 未知 */
+    lv_obj_t *lbl_status;      /* 全部在线 / N 台离线 / 等待设备 / 未知 */
     lv_obj_t *lbl_page;        /* 当前页面名 */
-    lv_obj_t *lbl_clock_warn;  /* clock_synced=false 的提示，平时隐藏 */
+    lv_obj_t *lbl_clock_warn;  /* 有设备 clock_synced=false 时的提示，平时隐藏 */
 
-    /* ---------- 总览页：指标卡 ---------- */
-    lv_obj_t *val_cpu;
-    lv_obj_t *det_cpu;
-    lv_obj_t *val_mem;
-    lv_obj_t *det_mem;
-    lv_obj_t *val_temp;
-    lv_obj_t *det_temp;
-    lv_obj_t *val_disk;
-    lv_obj_t *det_disk;
+    /* ---------- 总览页：每设备一张摘要卡 ---------- */
+    lv_obj_t *lbl_dev_name[UI_DEVICE_SLOTS];    /* 泰山派 3M / Windows 主机 / 原始 id */
+    lv_obj_t *lbl_dev_state[UI_DEVICE_SLOTS];   /* 在线 / 离线 / 过期 / 未知 / 等待 */
+    lv_obj_t *lbl_dev_cpu[UI_DEVICE_SLOTS];     /* CPU 大字，未上报显示 -- */
+    lv_obj_t *lbl_dev_mem[UI_DEVICE_SLOTS];     /* 内存大字 */
+    lv_obj_t *lbl_dev_detail[UI_DEVICE_SLOTS];  /* 等待 Hub 数据 / 数据已过期 / 未上报 */
 
     /* ---------- 总览页：网络 / MQTT 卡 ---------- */
     lv_obj_t *lbl_net_state;
@@ -39,32 +43,79 @@ typedef struct {
     lv_obj_t *lbl_mqtt_detail;
 
     /* ---------- 监控页：设备标题 ---------- */
-    lv_obj_t *lbl_mon_device;      /* "泰山派 3M" */
-    lv_obj_t *lbl_mon_link;        /* 在线 / 过期 / 等待数据 */
+    lv_obj_t *lbl_mon_device;      /* 当前设备名（中文名，未登记时为原始 id） */
+    lv_obj_t *lbl_mon_id;          /* 协议 device_id，跟在名字下面，便于对日志 */
+    lv_obj_t *lbl_mon_link;        /* 数据在线 / 数据已过期 / 设备离线 / 等待数据 */
+    lv_obj_t *lbl_mon_age;         /* 更新于 N s 前，让人知道数字有多旧 */
+    lv_obj_t *btn_mon_prev;        /* ◀ 上一个设备 */
+    lv_obj_t *btn_mon_next;        /* ▶ 下一个设备 */
 
-    /* ---------- 监控页：六个温区 ---------- */
-    lv_obj_t *val_zone[6];
-    lv_obj_t *det_zone[6];         /* 温区名，例如 soc-thermal */
+    /* ---------- 监控页：CPU / GPU 大卡（480x240） ---------- */
+    lv_obj_t *lbl_cg_title;        /* 「CPU / GPU」或「CPU / 容器」 */
+    lv_obj_t *lbl_cg_gpu_name;     /* 右上角显卡短名，例如 RTX 4060 Laptop */
+    lv_obj_t *val_cpu_big;         /* CPU 占用大字 */
+    lv_obj_t *val_gpu_big;         /* GPU 利用率大字 */
+    lv_obj_t *bar_cpu;             /* CPU 占用进度条（0~100） */
+    lv_obj_t *bar_gpu;             /* GPU 利用率进度条（0~100） */
+    lv_obj_t *det_cpu;             /* 「16 线程」 */
+    lv_obj_t *det_cpu2;            /* 「采样 2 s」 */
+    lv_obj_t *lbl_gpu_temp_cap;    /* 「温度」两个字的标签 */
+    lv_obj_t *val_gpu_temp;        /* 「43 ℃」 */
+    lv_obj_t *det_gpu_mem;         /* 「显存 1.2 / 8.0 GB」 */
 
-    /* ---------- 监控页：负载 1·5·15 ---------- */
+    /* 右半列：有 GPU 显示 GPU，没有 GPU 的机器显示运行中的容器 */
+    lv_obj_t *gpu_col;             /* 216x208 容器（GPU 那一列） */
+    lv_obj_t *cont_col;            /* 同坐标的容器列，默认隐藏 */
+    lv_obj_t *lbl_cont_count;      /* 右上「2 个」 */
+    lv_obj_t *lbl_cont_name[4];    /* 容器名（优先 compose service 名） */
+    lv_obj_t *dot_cont[4];         /* 每行前面的绿点 */
+    lv_obj_t *lbl_cont_note;       /* 无数据时的说明 */
+
+    /* ---------- 监控页：右侧卡（进程 / 温区，二选一显示） ---------- */
+    lv_obj_t *card_proc;           /* 464x240 进程卡 */
+    lv_obj_t *lbl_proc_title;      /* 「进程」+ 右上「按 CPU 排序」 */
+    lv_obj_t *lbl_proc_hint;
+    lv_obj_t *lbl_proc_th[3];      /* 表头：进程 / CPU / 内存 */
+    lv_obj_t *lbl_proc_name[3];
+    lv_obj_t *lbl_proc_cpu[3];
+    lv_obj_t *lbl_proc_mem[3];
+    lv_obj_t *lbl_proc_foot;       /* 「共 214 个进程 · 仅列出前 3」 */
+
+    lv_obj_t *card_zone;           /* 同一坐标的温区卡（Linux 回退） */
+    lv_obj_t *lbl_zone_title;
+    lv_obj_t *lbl_zone_name[6];
+    lv_obj_t *lbl_zone_val[6];
+
+    /* ---------- 监控页：左下卡（网络 / 平均负载 / 运行时长，按能力切换） ---------- */
+    lv_obj_t *card_net;            /* 304x140 网络卡 */
+    lv_obj_t *lbl_mon_net_ip;
+    lv_obj_t *lbl_mon_net_rx;
+    lv_obj_t *lbl_mon_net_tx;
+    lv_obj_t *lbl_mon_net_note;
+
+    lv_obj_t *card_load;           /* 同一坐标的负载/运行时长卡（网络缺失时的回退） */
+    lv_obj_t *lbl_load_title;      /* 「平均负载」或「运行时长」 */
     lv_obj_t *val_load1;
     lv_obj_t *val_load5;
     lv_obj_t *val_load15;
+    lv_obj_t *val_uptime;          /* 「3 天 5 小时」，与 load 三值互斥显示 */
+    lv_obj_t *lbl_load_note;       /* 底部说明：1/5/15 分钟 或 开机至今 */
 
     /* ---------- 监控页：内存 / 交换 / 磁盘详情 ---------- */
     lv_obj_t *lbl_mon_disk_title;
+    lv_obj_t *lbl_disk_parts;      /* 标题右侧「共 3 个分区」 */
+    lv_obj_t *det_disk_parts;      /* 底部「D: 41.1%  S: 27.7%」 */
     lv_obj_t *val_mon_mem;
     lv_obj_t *det_mon_mem;
     lv_obj_t *val_mon_swap;
     lv_obj_t *val_mon_disk;
     lv_obj_t *det_mon_disk;
-
-    /* ---------- 监控页：服务 ---------- */
-    lv_obj_t *lbl_svc[6];
-    lv_obj_t *lbl_svc_state[6];
 } app_ui_ctx_t;
 
 extern app_ui_ctx_t s_ctx;
+
+/* 监控页当前显示的设备槽位（◀ ▶ 按钮改它，轮询回调读它） */
+extern int s_mon_slot;
 
 /* 配色：深色背景 + 高对比前景，1024x600 远距离可读 */
 #define COLOR_BG        lv_color_hex(0x101418)

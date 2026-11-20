@@ -1,8 +1,9 @@
 /*
- * 泰山派 3M 在线状态（S2-c）
+ * 设备在线状态（S2-c 单设备版 → S2-e 多设备）
  *
- * 解析 hub/v1/devices/taishan-3m/status（含 LWT 的 offline 帧），只对外提供
- * 一份互斥保护的只读快照。在线判定规则见 .c 文件头与 protocol/topics-v1.md §3。
+ * 解析 hub/v1/devices/{device_id}/status（含 LWT 的 offline 帧），按设备槽位
+ * 提供互斥保护的只读快照。槽位由 device_registry 分配，和 device_metrics
+ * 共用同一套下标。在线判定规则见 .c 文件头与 protocol/topics-v1.md §3。
  *
  * state 字段已经是「综合判定过」的结果：
  *   - ONLINE   在线（心跳新鲜）
@@ -45,7 +46,7 @@ typedef struct {
 } device_status_t;
 
 /**
- * @brief 初始化互斥锁与空快照
+ * @brief 初始化互斥锁与全部空快照
  *
  * 必须在注册 MQTT 数据回调之前调用（未初始化时 on_message 直接返回）。
  */
@@ -55,5 +56,9 @@ esp_err_t device_status_init(void);
 void device_status_on_message(const char *topic, int topic_len,
                               const char *data, int data_len);
 
-/** 取一份快照（已含 age_ms / expired 现算字段） */
-void device_status_get(device_status_t *out);
+/**
+ * @brief 取某个设备槽位的状态快照（已含 age_ms / expired 现算字段）
+ *
+ * @param slot  device_registry 分配的槽位号；越界时返回全零（UNKNOWN）
+ */
+void device_status_get(int slot, device_status_t *out);

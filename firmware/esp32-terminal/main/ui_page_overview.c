@@ -1,12 +1,13 @@
 /*
- * 总览页（S2-d）
+ * 总览页（S2-d 单设备 → S2-e 多设备）
  *
- * 原 S2-b/S2-c 那一屏整体搬进「总览」页签里：四张指标卡 + 一张网络卡 + 一张 MQTT 卡。
- * 在线状态灯已经挪到跨页面常驻的顶部状态栏（见 app_ui.c），这里不再重复。
+ * 布局：上半区 4 张「每设备一张」的摘要卡，下半区保留本机网络卡和 MQTT 卡。
+ * 摘要卡只回答「这台机器大概怎么样」：在线状态 + CPU + 内存；
+ * 细节（温区、服务、磁盘）在监控页，用 ◀ ▶ 切换设备查看。
  *
  * 页面尺寸 = 1024 x (600 - 状态栏 56 - 页签栏 56) = 1024 x 488。
  *
- * 新鲜度与「--」的规则全部沿用 S2-b：
+ * 新鲜度与「--」的规则沿用 S2-b：
  *   - 解析成功且未过期才显示数值，否则显示 "--"；
  *   - 说明文字按「等待 Hub 数据 / 数据已过期 / 未上报」区分，绝不把没数据说成 0。
  */
@@ -16,6 +17,8 @@
 #include <stdio.h>
 
 #include "device_metrics.h"
+#include "device_registry.h"
+#include "device_status.h"
 #include "eth_link.h"
 #include "mqtt_link.h"
 
@@ -26,30 +29,16 @@
 #define NET_POLL_PERIOD_MS      (500)
 #define MQTT_POLL_PERIOD_MS     (1000)
 
+/* 上面四张设备卡：4×222 + 3×24 = 960，正好铺满 1024 减去左右 32 边距 */
+#define DEV_CARD_W      (222)
+#define DEV_CARD_H      (260)
+#define DEV_CARD_GAP    (24)
+#define DEV_CARD_X0     (32)
+#define DEV_CARD_Y      (24)
+
 /* ---------------------------------------------------------------- 工具函数 */
 
-/** 一个指标卡：标题贴顶、大字数值居中、细节贴底 */
-static lv_obj_t *create_metric_card(lv_obj_t *parent, int32_t x, int32_t y,
-                                    int32_t w, int32_t h, const char *title,
-                                    lv_obj_t **out_value, lv_obj_t **out_detail)
-{
-    lv_obj_t *card = ui_card(parent, w, h);
-    lv_obj_set_pos(card, x, y);
-
-    lv_obj_t *t = ui_label(card, &lv_font_cjk_20, COLOR_MUTED, title);
-    lv_obj_align(t, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    /* 数值只有数字和 %，用 Montserrat 36 更有冲击力 */
-    *out_value = ui_label(card, &lv_font_montserrat_36, COLOR_STALE, "--");
-    lv_obj_align(*out_value, LV_ALIGN_LEFT_MID, 0, 6);
-
-    *out_detail = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "");
-    lv_obj_align(*out_detail, LV_ALIGN_BOTTOM_LEFT, 0, 0);
-
-    return card;
-}
-
-/** 数值位置显示 "--" 时的说明文字。绝不能把「没有数据」说成「0」。 */
+/** 没有数据时的说明文字。绝不能把「没有数据」说成「0」。 */
 static const char *placeholder_detail(const device_metrics_t *m)
 {
     if (!m->valid) {
@@ -61,97 +50,129 @@ static const char *placeholder_detail(const device_metrics_t *m)
     return "未上报";
 }
 
-/* ---------------------------------------------------------------- 指标区 */
-
-static void metrics_poll_cb(lv_timer_t *timer)
+/** 设备在线状态 → 屏幕上的短词 + 颜色（协议 §3 的五级判定在 device_status 里） */
+static const char *state_text(const device_status_t *s, lv_color_t *color)
 {
-    (void)timer;
+    if (!s->ever_received) {
+        *color = COLOR_MUTED;
+        return "未知";
+    }
+    switch (s->state) {
+    case DEVICE_STATUS_ONLINE:
+        *color = COLOR_OK;
+        return "在线";
+    case DEVICE_STATUS_OFFLINE:
+        *color = COLOR_ERR;
+        return "离线";
+    default:
+        /* UNKNOWN 且收到过：说明是心跳超时，说「过期」比「未知」准确 */
+        *color = COLOR_WARN;
+        return s->expired ? "过期" : "未知";
+    }
+}
 
+/* ---------------------------------------------------------------- 设备摘要 */
+
+/** 单张设备摘要卡：设备名 + 状态 + CPU 大字 + 内存 + 底部说明 */
+static void create_device_card(lv_obj_t *parent, int slot, int32_t x)
+{
+    lv_obj_t *card = ui_card(parent, DEV_CARD_W, DEV_CARD_H);
+    lv_obj_set_pos(card, x, DEV_CARD_Y);
+
+    /* 设备名可能是中文显示名，也可能是未登记设备的原始 id（ASCII） */
+    s_ctx.lbl_dev_name[slot] = ui_label(card, &lv_font_cjk_20, COLOR_TEXT, "等待设备");
+    lv_obj_align(s_ctx.lbl_dev_name[slot], LV_ALIGN_TOP_LEFT, 0, 0);
+
+    s_ctx.lbl_dev_state[slot] = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "未知");
+    lv_obj_align(s_ctx.lbl_dev_state[slot], LV_ALIGN_TOP_RIGHT, 0, 2);
+
+    lv_obj_t *cpu_cap = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "CPU 占用");
+    lv_obj_set_pos(cpu_cap, 0, 36);
+
+    /* 数值只有数字和 %，用 Montserrat 36 更有冲击力 */
+    s_ctx.lbl_dev_cpu[slot] = ui_label(card, &lv_font_montserrat_36, COLOR_STALE, "--");
+    lv_obj_set_pos(s_ctx.lbl_dev_cpu[slot], 0, 56);
+
+    s_ctx.lbl_dev_mem[slot] = ui_label(card, &lv_font_cjk_20, COLOR_MUTED, "内存 --");
+    lv_obj_set_pos(s_ctx.lbl_dev_mem[slot], 0, 112);
+
+    s_ctx.lbl_dev_detail[slot] = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "");
+    lv_obj_align(s_ctx.lbl_dev_detail[slot], LV_ALIGN_BOTTOM_LEFT, 0, 0);
+}
+
+/** 槽位里没有设备：整张卡降为灰色提示，别让空槽看起来像「离线」 */
+static void apply_empty_slot(int slot)
+{
+    lv_obj_set_style_text_color(s_ctx.lbl_dev_name[slot], COLOR_STALE, 0);
+    lv_label_set_text(s_ctx.lbl_dev_name[slot], "未接入设备");
+    lv_label_set_text(s_ctx.lbl_dev_state[slot], "");
+    lv_label_set_text(s_ctx.lbl_dev_cpu[slot], "--");
+    lv_obj_set_style_text_color(s_ctx.lbl_dev_cpu[slot], COLOR_STALE, 0);
+    lv_label_set_text(s_ctx.lbl_dev_mem[slot], "");
+    lv_label_set_text(s_ctx.lbl_dev_detail[slot], "");
+}
+
+static void apply_device_slot(int slot, const device_registry_entry_t *entry)
+{
     device_metrics_t m;
-    device_metrics_get(&m);
+    device_metrics_get(slot, &m);
 
-    /* 「可以当当前值显示」= 解析成功且未过期。
-     * 过期后数值降为灰色 "--"，说明文字继续告诉人是断了还是没上报。 */
+    device_status_t st;
+    device_status_get(slot, &st);
+
+    /* 未登记的设备没有中文名，直接显示协议 id（协议保证是 ASCII 小写） */
+    lv_obj_set_style_text_color(s_ctx.lbl_dev_name[slot], COLOR_TEXT, 0);
+    lv_label_set_text(s_ctx.lbl_dev_name[slot],
+                      entry->name[0] ? entry->name : entry->id);
+
+    lv_color_t state_color = COLOR_MUTED;
+    const char *state = state_text(&st, &state_color);
+    lv_label_set_text(s_ctx.lbl_dev_state[slot], state);
+    lv_obj_set_style_text_color(s_ctx.lbl_dev_state[slot], state_color, 0);
+
+    /* 「可以当当前值显示」= 解析成功且未过期 */
     const bool fresh = m.valid && !m.expired;
-    const char *placeholder = placeholder_detail(&m);
-
     char value[32];
     char detail[64];
 
-    /* ---- CPU ---- */
     if (fresh && m.has_cpu) {
         snprintf(value, sizeof(value), "%.1f%%", m.cpu_percent);
-        if (m.has_load && m.cpu_cores > 0) {
-            snprintf(detail, sizeof(detail), "%d 核   负载 %.2f", m.cpu_cores, m.load1);
-        } else {
-            snprintf(detail, sizeof(detail), "占用率");
-        }
     } else {
         snprintf(value, sizeof(value), "--");
-        snprintf(detail, sizeof(detail), "%s", placeholder);
     }
-    lv_obj_set_style_text_color(s_ctx.val_cpu, fresh ? COLOR_ACCENT : COLOR_STALE, 0);
-    lv_label_set_text(s_ctx.val_cpu, value);
-    lv_label_set_text(s_ctx.det_cpu, detail);
+    lv_obj_set_style_text_color(s_ctx.lbl_dev_cpu[slot],
+                                fresh && m.has_cpu ? COLOR_ACCENT : COLOR_STALE, 0);
+    lv_label_set_text(s_ctx.lbl_dev_cpu[slot], value);
 
-    /* ---- 内存 ---- */
     if (fresh && m.has_mem) {
-        snprintf(value, sizeof(value), "%.1f%%", m.mem_percent);
-        if (!ui_format_bytes_pair(detail, sizeof(detail), m.mem_used_bytes, m.mem_total_bytes)) {
-            snprintf(detail, sizeof(detail), "已占用");
-        }
+        lv_label_set_text_fmt(s_ctx.lbl_dev_mem[slot], "内存 %.1f%%", m.mem_percent);
     } else {
-        snprintf(value, sizeof(value), "--");
-        snprintf(detail, sizeof(detail), "%s", placeholder);
+        lv_label_set_text(s_ctx.lbl_dev_mem[slot], "内存 --");
     }
-    lv_obj_set_style_text_color(s_ctx.val_mem, fresh ? COLOR_OK : COLOR_STALE, 0);
-    lv_label_set_text(s_ctx.val_mem, value);
-    lv_label_set_text(s_ctx.det_mem, detail);
 
-    /* ---- 主控温度 ---- */
-    if (fresh && m.has_soc) {
-        /* LVGL 默认字体没有 "°"，用 C 代替，避免出现方块字 */
-        snprintf(value, sizeof(value), "%.1f C", m.soc_celsius);
-        if (m.has_soc_max) {
-            snprintf(detail, sizeof(detail), "最高 %.1f C", m.soc_max_celsius);
+    /* 底部一行：有数据时给内存的绝对用量，没数据时说清楚是哪种「没数据」 */
+    if (fresh && ui_format_bytes_pair(detail, sizeof(detail),
+                                      m.mem_used_bytes, m.mem_total_bytes)) {
+        lv_label_set_text(s_ctx.lbl_dev_detail[slot], detail);
+    } else {
+        lv_label_set_text(s_ctx.lbl_dev_detail[slot], placeholder_detail(&m));
+    }
+}
+
+static void devices_poll_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    const int count = device_registry_count();
+    for (int slot = 0; slot < UI_DEVICE_SLOTS; slot++) {
+        if (slot < count) {
+            device_registry_entry_t entry;
+            device_registry_get(slot, &entry);
+            apply_device_slot(slot, &entry);
         } else {
-            snprintf(detail, sizeof(detail), "主控传感器");
-        }
-    } else {
-        snprintf(value, sizeof(value), "--");
-        snprintf(detail, sizeof(detail), "%s", placeholder);
-    }
-    /* 温度 >= 70 C 已偏离正常待机区间，用黄色提示 */
-    lv_color_t temp_color = COLOR_TEXT;
-    if (fresh && m.has_soc && m.soc_celsius >= 70.0) {
-        temp_color = COLOR_WARN;
-    }
-    lv_obj_set_style_text_color(s_ctx.val_temp, fresh ? temp_color : COLOR_STALE, 0);
-    lv_label_set_text(s_ctx.val_temp, value);
-    lv_label_set_text(s_ctx.det_temp, detail);
-
-    /* ---- 磁盘 ---- */
-    if (fresh && m.has_disk) {
-        snprintf(value, sizeof(value), "%.1f%%", m.disk_percent);
-        if (!ui_format_bytes_pair(detail, sizeof(detail), m.disk_used_bytes, m.disk_total_bytes)) {
-            snprintf(detail, sizeof(detail), "已占用");
-        }
-    } else {
-        snprintf(value, sizeof(value), "--");
-        snprintf(detail, sizeof(detail), "%s", placeholder);
-    }
-    /* 磁盘 >= 85% 红色，>= 70% 黄色 */
-    lv_color_t disk_color = COLOR_TEXT;
-    if (fresh && m.has_disk) {
-        if (m.disk_percent >= 85.0) {
-            disk_color = COLOR_ERR;
-        } else if (m.disk_percent >= 70.0) {
-            disk_color = COLOR_WARN;
+            apply_empty_slot(slot);
         }
     }
-    lv_obj_set_style_text_color(s_ctx.val_disk, fresh ? disk_color : COLOR_STALE, 0);
-    lv_label_set_text(s_ctx.val_disk, value);
-    lv_label_set_text(s_ctx.det_disk, detail);
 }
 
 /* ---------------------------------------------------------------- 以太网 */
@@ -282,22 +303,10 @@ static void mqtt_poll_cb(lv_timer_t *timer)
 
 void ui_page_overview_build(lv_obj_t *page)
 {
-    /* ---- 四张指标卡：CPU / 内存 / 主控温度 / 磁盘 ----
-     * 宽度：4×222 + 3×24 = 960，正好铺满 1024 减去左右 32 边距。
-     * 卡片高度按 488 的页面高度重排：4×222 卡 + 底部两张 150 卡。 */
-    const int32_t card_w = 222;
-    const int32_t card_h = 200;
-    const int32_t gap    = 24;
-    const int32_t row_y  = 40;
-
-    create_metric_card(page, 32, row_y, card_w, card_h, "CPU",
-                       &s_ctx.val_cpu, &s_ctx.det_cpu);
-    create_metric_card(page, 32 + (card_w + gap), row_y, card_w, card_h, "内存",
-                       &s_ctx.val_mem, &s_ctx.det_mem);
-    create_metric_card(page, 32 + 2 * (card_w + gap), row_y, card_w, card_h, "主控温度",
-                       &s_ctx.val_temp, &s_ctx.det_temp);
-    create_metric_card(page, 32 + 3 * (card_w + gap), row_y, card_w, card_h, "磁盘",
-                       &s_ctx.val_disk, &s_ctx.det_disk);
+    /* ---- 上半区：每设备一张摘要卡 ---- */
+    for (int slot = 0; slot < UI_DEVICE_SLOTS; slot++) {
+        create_device_card(page, slot, DEV_CARD_X0 + slot * (DEV_CARD_W + DEV_CARD_GAP));
+    }
 
     /* ---- 底部左：以太网链路 + IP ---- */
     lv_obj_t *card_net = ui_card(page, 468, 150);
@@ -335,12 +344,12 @@ void ui_page_overview_build(lv_obj_t *page)
     lv_obj_align(s_ctx.lbl_mqtt_detail, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     /* ---- 定时器 ---- */
-    lv_timer_create(metrics_poll_cb, METRICS_POLL_PERIOD_MS, NULL);
+    lv_timer_create(devices_poll_cb, METRICS_POLL_PERIOD_MS, NULL);
     lv_timer_create(net_poll_cb, NET_POLL_PERIOD_MS, NULL);
     lv_timer_create(mqtt_poll_cb, MQTT_POLL_PERIOD_MS, NULL);
 
     /* 首帧就填上真实状态，避免开机先闪一下占位文字 */
-    metrics_poll_cb(NULL);
+    devices_poll_cb(NULL);
     net_poll_cb(NULL);
     mqtt_poll_cb(NULL);
 }

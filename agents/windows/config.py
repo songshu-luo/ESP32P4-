@@ -50,7 +50,7 @@ class AgentConfig:
     username: str
     password: str
     agent_version: str = "0.1.0"
-    schema_version: int = 1
+    schema_version: int = 3
 
     # 采样/发布节奏，与 protocol/topics-v1.md §4.2 一致
     cpu_interval: float = 2.0
@@ -58,6 +58,11 @@ class AgentConfig:
     temperature_interval: float = 30.0
     disk_interval: float = 30.0
     services_interval: float = 10.0
+    # nvidia-smi 每次要起一个进程（60~120 ms），比读 /proc 贵，所以放慢到 5 s
+    gpu_interval: float = 5.0
+    # 进程 CPU / 网速的累计值差分：一条 240 ms 的 Get-Process，10 s 一次足够
+    procnet_interval: float = 10.0
+    disks_interval: float = 30.0
     metrics_interval: float = 2.0
     status_interval: float = 5.0
     loop_tick: float = 0.5

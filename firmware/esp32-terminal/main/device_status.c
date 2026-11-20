@@ -1,7 +1,7 @@
 /*
- * 泰山派 3M 在线状态（S2-c）
+ * 设备在线状态（S2-c 单设备版 → S2-e 多设备）
  *
- * 只解析 hub/v1/devices/taishan-3m/status，并实现协议 §3 的在线判定：
+ * 解析 hub/v1/devices/{device_id}/status，并实现协议 §3 的在线判定：
  *
  *   1. Hub 不可达（MQTT 断线）  → 未知        ← 这一条由 UI 结合 mqtt_link 判断
  *   2. 收到 LWT 的 state=offline → 离线
@@ -14,6 +14,9 @@
  * 必须由订阅方覆盖成未知——这是协议里唯一一条关于「不要相信缓存」的硬性要求。
  *
  * 新鲜度同样用「到达时刻 + valid_for_seconds」，理由见 device_metrics.h。
+ *
+ * S2-e 的改动：快照从「一份」变成「按设备槽位的一份数组」，槽位号和
+ * device_metrics 共用，所以下标相同即同一台设备。
  */
 
 #include "device_status.h"
@@ -29,9 +32,11 @@
 
 #include "cJSON.h"
 
+#include "device_registry.h"
+
 static const char *TAG = "dev_status";
 
-#define TOPIC_PREFIX        "hub/v1/devices/taishan-3m/"
+/* 只认 hub/v1/devices/{device_id}/status；device_id 的解析交给 device_registry */
 #define TOPIC_SUFFIX        "status"
 
 /* status 帧很小，1 KB 足够；超了直接丢弃不解析 */
@@ -41,8 +46,8 @@ static const char *TAG = "dev_status";
 #define DEFAULT_VALID_FOR   (15)
 
 static SemaphoreHandle_t s_lock;
-static device_status_t   s_snapshot;
-static int64_t           s_last_arrival_us;   /* 0 = 从未收到 */
+static device_status_t   s_snapshot[DEVICE_REGISTRY_MAX_DEVICES];
+static int64_t           s_last_arrival_us[DEVICE_REGISTRY_MAX_DEVICES];  /* 0 = 从未收到 */
 static bool              s_initialized;
 
 /* ------------------------------------------------------------ 小工具 */
@@ -63,8 +68,15 @@ static bool get_number(const cJSON *obj, const char *key, double *out)
 static bool parse_frame(const cJSON *root, device_status_t *dst)
 {
     const cJSON *ver = cJSON_GetObjectItemCaseSensitive(root, "schema_version");
-    if (!cJSON_IsNumber(ver) || (int)ver->valuedouble != 1) {
-        ESP_LOGW(TAG, "unsupported schema_version, frame dropped");
+    if (!cJSON_IsNumber(ver)) {
+        ESP_LOGW(TAG, "missing schema_version, frame dropped");
+        return false;
+    }
+    /* v2 只在 metrics 里加了 gpu，status 的字段一个都没动，所以 1 和 2 都收；
+     * 再高就不认识了，直接丢。metrics 的同一处判断见 device_metrics.c。 */
+    const int schema = (int)ver->valuedouble;
+    if (schema < 1 || schema > 4) {
+        ESP_LOGW(TAG, "unsupported schema_version %d, frame dropped", schema);
         return false;
     }
 
@@ -133,11 +145,10 @@ void device_status_on_message(const char *topic, int topic_len,
         return;
     }
 
-    const int prefix_len = (int)strlen(TOPIC_PREFIX);
-    const int suffix_len = (int)strlen(TOPIC_SUFFIX);
-    if (topic_len != prefix_len + suffix_len ||
-        memcmp(topic, TOPIC_PREFIX, prefix_len) != 0 ||
-        memcmp(topic + prefix_len, TOPIC_SUFFIX, suffix_len) != 0) {
+    /* 主题过滤 + device_id 解析都交给 device_registry：只有恰好四段的
+     * hub/v1/devices/{id}/status 才会通过，其余一律忽略。 */
+    const int slot = device_registry_slot_from_topic(topic, topic_len, TOPIC_SUFFIX);
+    if (slot < 0) {
         return;
     }
 
@@ -165,16 +176,16 @@ void device_status_on_message(const char *topic, int topic_len,
     const int64_t now_us = esp_timer_get_time();
 
     if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        next.frame_count = s_snapshot.frame_count + 1;
-        s_snapshot = next;
-        s_last_arrival_us = now_us;
+        next.frame_count = s_snapshot[slot].frame_count + 1;
+        s_snapshot[slot] = next;
+        s_last_arrival_us[slot] = now_us;
         xSemaphoreGive(s_lock);
     }
 
     /* LWT 和每次状态变化都值得打一行；正常心跳只每 60 帧（约 5 分钟）打一次 */
     if (next.state != DEVICE_STATUS_ONLINE || next.frame_count == 1 || next.frame_count % 60 == 0) {
-        ESP_LOGI(TAG, "frame #%u  state=%s  host=%s  ip=%s  clock_synced=%d",
-                 (unsigned)next.frame_count,
+        ESP_LOGI(TAG, "device %d frame #%u  state=%s  host=%s  ip=%s  clock_synced=%d",
+                 slot, (unsigned)next.frame_count,
                  next.state == DEVICE_STATUS_ONLINE ? "online" :
                  next.state == DEVICE_STATUS_OFFLINE ? "offline" : "unknown",
                  next.hostname[0] ? next.hostname : "-",
@@ -183,23 +194,23 @@ void device_status_on_message(const char *topic, int topic_len,
     }
 }
 
-void device_status_get(device_status_t *out)
+void device_status_get(int slot, device_status_t *out)
 {
     if (out == NULL) {
         return;
     }
     memset(out, 0, sizeof(*out));
-    if (s_lock == NULL) {
+    if (slot < 0 || slot >= DEVICE_REGISTRY_MAX_DEVICES || s_lock == NULL) {
         return;
     }
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) {
         return;
     }
-    *out = s_snapshot;
+    *out = s_snapshot[slot];
 
-    if (s_last_arrival_us > 0) {
+    if (s_last_arrival_us[slot] > 0) {
         out->ever_received = true;
-        const int64_t age_us = esp_timer_get_time() - s_last_arrival_us;
+        const int64_t age_us = esp_timer_get_time() - s_last_arrival_us[slot];
         out->age_ms = (uint32_t)(age_us / 1000);
 
         /* 只有 online 会过期：offline 是 LWT 给出的确定性结论，
@@ -223,8 +234,8 @@ esp_err_t device_status_init(void)
         }
     }
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        memset(&s_snapshot, 0, sizeof(s_snapshot));
-        s_last_arrival_us = 0;
+        memset(s_snapshot, 0, sizeof(s_snapshot));
+        memset(s_last_arrival_us, 0, sizeof(s_last_arrival_us));
         xSemaphoreGive(s_lock);
     }
     s_initialized = true;
