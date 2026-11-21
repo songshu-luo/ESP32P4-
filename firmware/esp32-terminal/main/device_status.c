@@ -72,10 +72,11 @@ static bool parse_frame(const cJSON *root, device_status_t *dst)
         ESP_LOGW(TAG, "missing schema_version, frame dropped");
         return false;
     }
-    /* v2 只在 metrics 里加了 gpu，status 的字段一个都没动，所以 1 和 2 都收；
-     * 再高就不认识了，直接丢。metrics 的同一处判断见 device_metrics.c。 */
+    /* v2 只在 metrics 里加了 gpu，status 的字段一个都没动；
+     * v5/v6 也只动了 metrics（checks / 分网卡），status 结构同样没变，
+     * 所以 1~6 都收，再高就不认识了，直接丢。metrics 的同一处判断见 device_metrics.c。 */
     const int schema = (int)ver->valuedouble;
-    if (schema < 1 || schema > 4) {
+    if (schema < 1 || schema > 6) {
         ESP_LOGW(TAG, "unsupported schema_version %d, frame dropped", schema);
         return false;
     }

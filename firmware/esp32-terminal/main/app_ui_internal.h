@@ -88,10 +88,15 @@ typedef struct {
 
     /* ---------- 监控页：左下卡（网络 / 平均负载 / 运行时长，按能力切换） ---------- */
     lv_obj_t *card_net;            /* 304x140 网络卡 */
+    /* 旧单行样式：IP + 单卡 ↓/↑（v1–v5 设备，或没有分网卡明细时） */
     lv_obj_t *lbl_mon_net_ip;
     lv_obj_t *lbl_mon_net_rx;
     lv_obj_t *lbl_mon_net_tx;
     lv_obj_t *lbl_mon_net_note;
+    /* 新两行样式（v6 netifs[]）：右上角「当前 有线/无线」，两行分别是有线 / 无线 */
+    lv_obj_t *lbl_net_active;
+    lv_obj_t *lbl_net_if[2];       /* 左侧「有线 1000M」/「无线 未接入」 */
+    lv_obj_t *lbl_net_rate[2];     /* 同一行右侧「↓1.2K ↑3.4K」 */
 
     lv_obj_t *card_load;           /* 同一坐标的负载/运行时长卡（网络缺失时的回退） */
     lv_obj_t *lbl_load_title;      /* 「平均负载」或「运行时长」 */
@@ -104,7 +109,9 @@ typedef struct {
     /* ---------- 监控页：内存 / 交换 / 磁盘详情 ---------- */
     lv_obj_t *lbl_mon_disk_title;
     lv_obj_t *lbl_disk_parts;      /* 标题右侧「共 3 个分区」 */
-    lv_obj_t *det_disk_parts;      /* 底部「D: 41.1%  S: 27.7%」 */
+    lv_obj_t *det_disk_parts;      /* 旧底部行，已不再使用，保留字段避免影响别处 */
+    lv_obj_t *lbl_disk_row[3];     /* 磁盘卡三行：左侧「C: 48.7%」 */
+    lv_obj_t *lbl_disk_val[3];     /* 磁盘卡三行：右侧「243.6 / 500.0 GB」 */
     lv_obj_t *val_mon_mem;
     lv_obj_t *det_mon_mem;
     lv_obj_t *val_mon_swap;

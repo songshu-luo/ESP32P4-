@@ -17,6 +17,12 @@ user windows-agent
 topic write hub/v1/devices/windows-main/status
 topic write hub/v1/devices/windows-main/metrics
 
+# ---- 云服务器指标 Agent：只能写自己的 status / metrics ----
+# 云服务器在局域网外，通过 Tailscale 连本机 1883；不能写其它设备主题。
+user cloud-agent
+topic write hub/v1/devices/cloud-main/status
+topic write hub/v1/devices/cloud-main/metrics
+
 # ---- ESP32 终端：只读全部设备状态，只能写命令结果回执 ----
 # 注意：ESP32 不能写 devices/*/metrics，无法伪造其他设备的数据。
 user esp32-terminal

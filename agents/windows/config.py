@@ -50,7 +50,7 @@ class AgentConfig:
     username: str
     password: str
     agent_version: str = "0.1.0"
-    schema_version: int = 3
+    schema_version: int = 6
 
     # 采样/发布节奏，与 protocol/topics-v1.md §4.2 一致
     cpu_interval: float = 2.0

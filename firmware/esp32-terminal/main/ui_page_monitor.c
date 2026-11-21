@@ -8,6 +8,7 @@
  * 本页的布局是「固定坐标 + 按能力切换卡面」，不是给每台设备写一套页面：
  *
  *   480x240 @ (32,68)   CPU / GPU           —— 两台设备都有（GPU 缺失时逐项显示 --）
+ *                       CPU / 任务状态      —— 无 GPU 时右列改成 5 项任务状态（v5 checks）
  *   464x240 @ (528,68)  进程   / 温区温度    —— 有 processes 就显示进程，否则回落温区
  *   304x140 @ (32,324)  网络   / 平均负载    —— 有 network 就显示网络，否则回落 load/uptime
  *   304x140 @ (352,324) 内存                —— 两台都有
@@ -55,6 +56,39 @@
 /* 进度条底槽与分隔线，比卡片亮一点点就够，太亮会抢大字的注意力 */
 #define COLOR_TRACK         lv_color_hex(0x27344a)
 #define COLOR_SEP           lv_color_hex(0x2c3a52)
+
+/* 任务状态列（无 GPU 设备的右列）：行高沿用原容器列表的 34 px；
+ * detail 列固定 68 px 宽，刚好放下 Agent 给的最长 detail「未检测到」（4 个汉字
+ * = 64 px）；左侧中文名占剩下的 124 px，「ESP32通信」这类中英混排也放得下。 */
+#define TASK_ROW_H          (34)
+#define TASK_DET_W          (68)
+
+/* down 用「灰红」：COLOR_ERR 在暗背景上太扎眼，和右侧「设备离线」抢注意力，
+ * 按 70% 亮度混入一点灰，仍然一眼能看出是红色系。 */
+#define CHECK_DOWN_COLOR    lv_color_hex(0xb4575a)
+
+/* 任务状态行的控件句柄。放本文件静态数组而不是 s_ctx：
+ * 行数由协议固定为 5，app_ui_internal.h 的容器行数组只有 4 个，且本次不改那个头文件。 */
+static lv_obj_t *s_chk_dot[DEVICE_METRICS_MAX_CHECKS];
+static lv_obj_t *s_chk_name[DEVICE_METRICS_MAX_CHECKS];
+static lv_obj_t *s_chk_det[DEVICE_METRICS_MAX_CHECKS];
+
+/* 字模收集提示 —— 不要删！
+ *
+ * 任务状态卡的 label / detail 全部来自 Agent 的 payload，不在本文件的任何字符串
+ * 字面量里；而 tools/gen_cjk_font.sh 只扫描源码字面量来挑汉字。少了这一行，
+ * 重新生成字模后屏幕上这 5 行会是空心方块（tofu）。
+ * 内容 = Agent 可能下发的全部汉字（labels 5 个 + details 7 种），重复无害。 */
+static const char k_check_glyph_hint[] __attribute__((unused)) =
+    "闲鱼助手网络代理通信摄像头在线运行中不健康未检测到监听连接";
+
+/* 字模收集提示 —— 不要删！
+ *
+ * 网络卡新样式的「有线 / 无线 / 未接入 / 当前 / 其他」都出现在运行时拼接的
+ * 字符串里（snprintf / 条件选词），不是完整的字面量；少了这一行，重新生成
+ * 字模后这几行会是空心方块（tofu）。build_network_card 里用 (void) 引用它，
+ * 保证 -Wunused 在 -Werror 下不会报错。 */
+static const char k_net_glyph_hint[] = "有线无线未接入当前其他";
 
 /* ---------------------------------------------------------------- 工具函数 */
 
@@ -146,6 +180,22 @@ static void format_rate(char *buf, size_t len, double bytes_per_sec)
         snprintf(buf, len, "%.1f KB/s", bytes_per_sec / kb);
     } else {
         snprintf(buf, len, "%.0f B/s", bytes_per_sec);
+    }
+}
+
+/** 字节/秒 → 「12B」/「1.2K」/「3.4M」：网络卡两行样式每行要塞 ↓/↑ 两个速率，
+ *  砍掉 "/s" 后缀换更短的单位，宽度才放得下。缺失值由调用方写 "--"。 */
+static void format_rate_short(char *buf, size_t len, double bytes_per_sec)
+{
+    const double kb = 1024.0;
+    const double mb = kb * 1024.0;
+
+    if (bytes_per_sec >= mb) {
+        snprintf(buf, len, "%.1fM", bytes_per_sec / mb);
+    } else if (bytes_per_sec >= kb) {
+        snprintf(buf, len, "%.1fK", bytes_per_sec / kb);
+    } else {
+        snprintf(buf, len, "%.0fB", bytes_per_sec);
     }
 }
 
@@ -344,7 +394,11 @@ static void build_cpu_gpu_card(lv_obj_t *page)
     s_ctx.det_gpu_mem = ui_label(s_ctx.gpu_col, &lv_font_cjk_16, COLOR_STALE, "");
     lv_obj_set_pos(s_ctx.det_gpu_mem, 0, 168);
 
-    /* ---- 同一坐标的容器列：没有 GPU 的机器（泰山派）显示运行中的容器 ---- */
+    /* ---- 同一坐标的右列：没有 GPU 的机器（泰山派）显示 5 项任务状态 ----
+     *
+     * 句柄放在本文件的静态数组里而不是 s_ctx：任务状态固定 5 行，
+     * 而 app_ui_internal.h 里的容器行数组只有 4 个，且本次不改那个头文件。
+     * 列容器本身仍复用 s_ctx.cont_col（坐标、尺寸与原来完全一致）。 */
     s_ctx.cont_col = lv_obj_create(card);
     lv_obj_remove_style_all(s_ctx.cont_col);
     lv_obj_remove_flag(s_ctx.cont_col, LV_OBJ_FLAG_SCROLLABLE);
@@ -352,35 +406,42 @@ static void build_cpu_gpu_card(lv_obj_t *page)
     lv_obj_set_size(s_ctx.cont_col, CG_COL_W, 208);
     lv_obj_add_flag(s_ctx.cont_col, LV_OBJ_FLAG_HIDDEN);
 
-    lv_obj_t *cap_cont = ui_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_MUTED, "运行容器");
-    lv_obj_set_pos(cap_cont, 0, 28);
+    lv_obj_t *cap_tasks = ui_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_MUTED, "任务状态");
+    lv_obj_set_pos(cap_tasks, 0, 28);   /* 与左列「CPU 占用」同一基线 */
 
-    s_ctx.lbl_cont_count = ui_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_STALE, "");
-    lv_obj_align(s_ctx.lbl_cont_count, LV_ALIGN_TOP_RIGHT, 0, 28);
-
-    for (int i = 0; i < 4; i++) {
-        const int32_t y = 58 + i * 34;
+    /* 5 行 × 34 px 行高（与原容器列表一致），从 y=50 起：
+     * 最后一行在 186，字体行高 20 → 底边 206，仍在 208 高的列内。 */
+    for (int i = 0; i < DEVICE_METRICS_MAX_CHECKS; i++) {
+        const int32_t y = 50 + i * TASK_ROW_H;
 
         lv_obj_t *dot = lv_obj_create(s_ctx.cont_col);
         lv_obj_remove_style_all(dot);
         lv_obj_set_size(dot, 8, 8);
         lv_obj_set_style_radius(dot, 4, 0);
-        lv_obj_set_style_bg_color(dot, COLOR_OK, 0);
+        lv_obj_set_style_bg_color(dot, COLOR_STALE, 0);
         lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
-        lv_obj_set_pos(dot, 0, y + 4);
+        lv_obj_set_pos(dot, 0, y + 6);
         lv_obj_add_flag(dot, LV_OBJ_FLAG_HIDDEN);
-        s_ctx.dot_cont[i] = dot;
+        s_chk_dot[i] = dot;
 
-        s_ctx.lbl_cont_name[i] = ui_label(s_ctx.cont_col, &lv_font_montserrat_16, COLOR_TEXT, "");
-        lv_obj_set_pos(s_ctx.lbl_cont_name[i], 18, y);
-        lv_obj_set_width(s_ctx.lbl_cont_name[i], CG_COL_W - 18);
-        lv_label_set_long_mode(s_ctx.lbl_cont_name[i], LV_LABEL_LONG_DOT);
-        lv_obj_add_flag(s_ctx.lbl_cont_name[i], LV_OBJ_FLAG_HIDDEN);
+        s_chk_name[i] = ui_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_TEXT, "");
+        lv_obj_set_pos(s_chk_name[i], 18, y);
+        lv_obj_set_width(s_chk_name[i], CG_COL_W - 18 - TASK_DET_W - 6);
+        lv_label_set_long_mode(s_chk_name[i], LV_LABEL_LONG_DOT);
+        lv_obj_add_flag(s_chk_name[i], LV_OBJ_FLAG_HIDDEN);
+
+        /* 右侧短说明（在线 / 未运行），固定宽度右对齐，切设备时列不跳 */
+        s_chk_det[i] = right_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_MUTED, "",
+                                   CG_COL_W - TASK_DET_W, TASK_DET_W);
+        lv_obj_set_pos(s_chk_det[i], CG_COL_W - TASK_DET_W, y);
+        lv_label_set_long_mode(s_chk_det[i], LV_LABEL_LONG_DOT);
+        lv_obj_add_flag(s_chk_det[i], LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* 一只容器都没有 / 压根读不到 docker 时的说明，避免空列 */
+    /* 整块没有数据时的说明（等待数据），放在第一行任务状态的位置上：
+     * 此时 5 行都隐藏，正好空出这一格，不会和标题重叠。 */
     s_ctx.lbl_cont_note = ui_label(s_ctx.cont_col, &lv_font_cjk_16, COLOR_STALE, "");
-    lv_obj_set_pos(s_ctx.lbl_cont_note, 0, 60);
+    lv_obj_set_pos(s_ctx.lbl_cont_note, 0, 50);
 }
 
 /* ---------------------------------------------------------------- 进程卡 */
@@ -473,14 +534,58 @@ static void build_zone_card(lv_obj_t *page)
 
 /* ---------------------------------------------------------------- 网络卡 */
 
+/* 网络卡 304x140，内边距 16 → 内容区 272x108。
+ * 新样式两行固定「第一行有线、第二行无线」，y 从内容区顶部算：
+ *   0   标题 / 右上「当前 有线」
+ *   34  有线行
+ *   68  无线行
+ * 行高 34：cjk16 行高 20，两行文字之间留 14 的空隙，远看不会黏在一起。 */
+#define NET_ROW_WIRED_Y     (34)
+#define NET_ROW_WIFI_Y      (68)
+#define NET_RATE_W          (120)   /* 右侧速率列固定宽，右对齐，切设备时不跳动 */
+
+/** 一张网卡在 card_net 内的行序号：有线 0，无线 1。
+ *  只认 "wired" / "wifi"，其余（null、空串、"other"）不上两行样式。 */
+static int netif_row_of(const device_metrics_netif_t *n)
+{
+    if (strcmp(n->type, "wired") == 0) {
+        return 0;
+    }
+    if (strcmp(n->type, "wifi") == 0) {
+        return 1;
+    }
+    return -1;
+}
+
 static void build_network_card(lv_obj_t *page)
 {
+    /* 字模提示串的引用点：见文件顶部 k_net_glyph_hint 的说明 */
+    (void)k_net_glyph_hint;
+
     s_ctx.card_net = ui_card(page, 304, 140);
     lv_obj_set_pos(s_ctx.card_net, 32, 324);
 
     lv_obj_t *title = ui_label(s_ctx.card_net, &lv_font_cjk_16, COLOR_MUTED, "网络");
     lv_obj_set_pos(title, 0, 0);
 
+    /* 右上角「当前 有线」：只有分网卡数据（v6）时才有意义 */
+    s_ctx.lbl_net_active = ui_label(s_ctx.card_net, &lv_font_cjk_16, COLOR_ACCENT, "");
+    lv_obj_align(s_ctx.lbl_net_active, LV_ALIGN_TOP_RIGHT, 0, 0);
+    lv_obj_add_flag(s_ctx.lbl_net_active, LV_OBJ_FLAG_HIDDEN);
+
+    /* 新样式两行：左侧名称左对齐，右侧速率右对齐（同一基线，量测字高不同时观感一致） */
+    static const int32_t row_y[2] = { NET_ROW_WIRED_Y, NET_ROW_WIFI_Y };
+    for (int i = 0; i < 2; i++) {
+        s_ctx.lbl_net_if[i] = ui_label(s_ctx.card_net, &lv_font_cjk_16, COLOR_MUTED, "");
+        lv_obj_set_pos(s_ctx.lbl_net_if[i], 0, row_y[i]);
+
+        s_ctx.lbl_net_rate[i] = right_label(s_ctx.card_net, &lv_font_cjk_16,
+                                            COLOR_MUTED, "",
+                                            272 - NET_RATE_W, NET_RATE_W);
+        lv_obj_set_pos(s_ctx.lbl_net_rate[i], 272 - NET_RATE_W, row_y[i]);
+    }
+
+    /* 旧单行样式：IP + 单卡 ↓/↑（v1–v5 设备），坐标保持原样 */
     s_ctx.lbl_mon_net_ip = ui_label(s_ctx.card_net, &lv_font_montserrat_20,
                                 COLOR_ACCENT, "--");
     lv_obj_set_pos(s_ctx.lbl_mon_net_ip, 0, 24);
@@ -494,6 +599,16 @@ static void build_network_card(lv_obj_t *page)
     s_ctx.lbl_mon_net_note = ui_label(s_ctx.card_net, &lv_font_cjk_16, COLOR_STALE,
                                   "局域网");
     lv_obj_align(s_ctx.lbl_mon_net_note, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+
+    /* 新旧两套互斥，由 apply_left_bottom 决定露哪一套；先全部藏起来 */
+    lv_obj_add_flag(s_ctx.lbl_mon_net_ip, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_ctx.lbl_mon_net_rx, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_ctx.lbl_mon_net_tx, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_ctx.lbl_mon_net_note, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < 2; i++) {
+        lv_obj_add_flag(s_ctx.lbl_net_if[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ctx.lbl_net_rate[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* ---------------------------------------------------------------- 负载卡（回退） */
@@ -563,15 +678,17 @@ static void build_disk_card(lv_obj_t *page)
     s_ctx.lbl_disk_parts = ui_label(card, &lv_font_cjk_16, COLOR_STALE, "");
     lv_obj_align(s_ctx.lbl_disk_parts, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-    s_ctx.val_mon_disk = ui_label(card, &lv_font_montserrat_28, COLOR_STALE, "--");
-    lv_obj_set_pos(s_ctx.val_mon_disk, 0, 26);
+    /* C / D / S 三行逐行显示：左侧盘符+占用率，右侧已用/总量 */
+    for (int i = 0; i < 3; i++) {
+        s_ctx.lbl_disk_row[i] = ui_label(card, &lv_font_cjk_16, COLOR_TEXT, "");
+        lv_obj_set_pos(s_ctx.lbl_disk_row[i], 0, 26 + i * 28);
 
-    s_ctx.det_mon_disk = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "");
-    lv_obj_set_pos(s_ctx.det_mon_disk, 0, 64);
+        s_ctx.lbl_disk_val[i] = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "");
+        lv_obj_align(s_ctx.lbl_disk_val[i], LV_ALIGN_TOP_RIGHT, 0, 26 + i * 28);
 
-    /* 底部一行列其余分区的占用率（D: 41.1%  S: 27.7%） */
-    s_ctx.det_disk_parts = ui_label(card, &lv_font_cjk_16, COLOR_STALE, "");
-    lv_obj_align(s_ctx.det_disk_parts, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+        lv_obj_add_flag(s_ctx.lbl_disk_row[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_ctx.lbl_disk_val[i], LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 /* ---------------------------------------------------------------- 轮询 */
@@ -634,40 +751,52 @@ static void apply_header(const device_registry_entry_t *entry,
     }
 }
 
-/** 右半列的容器列表：只列前 4 个，数量用 container_count 表达 */
-static void apply_containers(const device_metrics_t *m, bool fresh)
+/** 任务状态圆点配色：ok 绿 / warn 琥珀 / down 灰红 / 未知灰 */
+static lv_color_t check_dot_color(device_check_state_t state)
 {
-    char buf[32];
-    if (m->has_container_count) {
-        snprintf(buf, sizeof(buf), "%d 个", m->container_count);
-        lv_label_set_text(s_ctx.lbl_cont_count, buf);
-    } else {
-        lv_label_set_text(s_ctx.lbl_cont_count, "");
+    switch (state) {
+    case DEVICE_CHECK_OK:   return COLOR_OK;
+    case DEVICE_CHECK_WARN: return COLOR_WARN;
+    case DEVICE_CHECK_DOWN: return CHECK_DOWN_COLOR;
+    default:                return COLOR_STALE;
     }
+}
 
-    const bool has_list = fresh && m->containers_len > 0;
-    for (int i = 0; i < 4; i++) {
-        if (has_list && i < m->containers_len) {
-            /* compose 起的容器显示服务名（app / postgres），比 27 字符的容器名好认 */
-            const char *label = m->containers[i].service[0] != '\0'
-                              ? m->containers[i].service
-                              : m->containers[i].name;
-            lv_label_set_text(s_ctx.lbl_cont_name[i], label);
-            lv_obj_remove_flag(s_ctx.lbl_cont_name[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_remove_flag(s_ctx.dot_cont[i], LV_OBJ_FLAG_HIDDEN);
+/**
+ * 右半列（无 GPU 设备）的 5 行任务状态（v5 checks）。
+ *
+ * checks_count <= 0 表示没拿到数据（缺失 / 解析失败 / 空数组），整列只显示
+ * 一句「等待数据」——不留空行，也不把 0 条说成「全部正常」。
+ * 某一行 detail 为空时只显示圆点和中文名，不补「--」，避免看起来像故障。
+ */
+static void apply_checks(const device_metrics_t *m, bool fresh)
+{
+    const bool has_list = fresh && m->checks_count > 0;
+    for (int i = 0; i < DEVICE_METRICS_MAX_CHECKS; i++) {
+        if (has_list && i < m->checks_count) {
+            const device_metrics_check_t *c = &m->checks[i];
+            lv_obj_set_style_bg_color(s_chk_dot[i], check_dot_color(c->state), 0);
+            lv_label_set_text(s_chk_name[i], c->label);
+            lv_label_set_text(s_chk_det[i], c->detail);
+            lv_obj_remove_flag(s_chk_dot[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_chk_name[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_chk_det[i], LV_OBJ_FLAG_HIDDEN);
         } else {
-            lv_obj_add_flag(s_ctx.lbl_cont_name[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_add_flag(s_ctx.dot_cont[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_chk_dot[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_chk_name[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_chk_det[i], LV_OBJ_FLAG_HIDDEN);
         }
     }
 
     if (has_list) {
         lv_label_set_text(s_ctx.lbl_cont_note, "");
-    } else if (m->valid && m->has_container_count && m->container_count == 0) {
-        lv_label_set_text(s_ctx.lbl_cont_note, "当前没有运行中的容器");
-    } else {
-        lv_label_set_text(s_ctx.lbl_cont_note, placeholder_detail(m));
+        return;
     }
+    /* 拿到了列表但帧已过期：和本页其它卡一样明说「数据已过期」
+     * （旧值不可信，但说清楚原因比笼统的「等待数据」有用）。
+     * 真正没数据时才是「等待数据」。 */
+    const bool stale_with_list = m->valid && m->expired && m->checks_count > 0;
+    lv_label_set_text(s_ctx.lbl_cont_note, stale_with_list ? "数据已过期" : "等待数据");
 }
 
 /** CPU/GPU 卡：所有「--」都带一句为什么没有，避免和真实的 0 混淆 */
@@ -701,18 +830,18 @@ static void apply_cpu_gpu(const device_metrics_t *m, bool fresh)
     lv_obj_set_style_text_color(s_ctx.val_cpu_big, has_cpu ? COLOR_ACCENT : COLOR_STALE, 0);
     lv_obj_set_style_text_color(s_ctx.det_cpu, has_cpu ? COLOR_MUTED : COLOR_STALE, 0);
 
-    /* ---- 右半列：有 GPU 走 GPU 列，没有 GPU 的机器走容器列 ---- */
+    /* ---- 右半列：有 GPU 走 GPU 列，没有 GPU 的机器走任务状态列 ---- */
     const bool has_gpu_dev = m->valid &&
         (m->gpu_name[0] != '\0' || m->has_gpu ||
          m->has_gpu_usage || m->has_gpu_temp);
-    lv_label_set_text(s_ctx.lbl_cg_title, has_gpu_dev ? "CPU / GPU" : "CPU / 容器");
+    lv_label_set_text(s_ctx.lbl_cg_title, has_gpu_dev ? "CPU / GPU" : "CPU / 任务状态");
     if (has_gpu_dev) {
         lv_obj_remove_flag(s_ctx.gpu_col, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_ctx.cont_col, LV_OBJ_FLAG_HIDDEN);
     } else {
         lv_obj_add_flag(s_ctx.gpu_col, LV_OBJ_FLAG_HIDDEN);
         lv_obj_remove_flag(s_ctx.cont_col, LV_OBJ_FLAG_HIDDEN);
-        apply_containers(m, fresh);
+        apply_checks(m, fresh);
     }
 
     /* ---- GPU ---- */
@@ -850,17 +979,137 @@ static void apply_right_card(const device_metrics_t *m, bool fresh)
     }
 }
 
+/** 右上角「当前 有线 / 当前 无线 / 当前 其他 / 当前 --」。
+ *  active_type 由 Agent 给（wired / wifi / other），认不出来就说「其他」，
+ *  没有 active 信息（v1–v5 帧、字符串缺失）才是「--」。 */
+static void netif_active_text(const device_metrics_t *m, char *buf, size_t len)
+{
+    const char *kind = "--";
+    if (m->has_active) {
+        if (strcmp(m->active_type, "wired") == 0) {
+            kind = "有线";
+        } else if (strcmp(m->active_type, "wifi") == 0) {
+            kind = "无线";
+        } else {
+            kind = "其他";
+        }
+    }
+    snprintf(buf, len, "当前 %s", kind);
+}
+
+/** 这一行网卡是不是当前上网卡：别名相同，或类型相同（active_id 可能只是别名变了） */
+static bool netif_is_active(const device_metrics_t *m, const device_metrics_netif_t *n)
+{
+    if (!m->has_active) {
+        return false;
+    }
+    return (m->active_id[0] != '\0' && strcmp(m->active_id, n->id) == 0) ||
+           (m->active_type[0] != '\0' && strcmp(m->active_type, n->type) == 0);
+}
+
+/** 网络卡新样式：有线一行、无线一行，当前上网那一行整行高亮 */
+static void apply_netif_rows(const device_metrics_t *m)
+{
+    /* 两行固定按 type 找，不按 netifs[] 顺序：只有一张卡时另一行直接隐藏 */
+    for (int row = 0; row < 2; row++) {
+        const device_metrics_netif_t *n = NULL;
+        for (int i = 0; i < m->netifs_len && i < DEVICE_METRICS_MAX_NETIFS; i++) {
+            if (netif_row_of(&m->netifs[i]) == row) {
+                n = &m->netifs[i];
+                break;
+            }
+        }
+
+        if (n == NULL) {
+            lv_obj_add_flag(s_ctx.lbl_net_if[row], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_ctx.lbl_net_rate[row], LV_OBJ_FLAG_HIDDEN);
+            continue;
+        }
+
+        const char *name = row == 0 ? "有线" : "无线";
+
+        /* 名称：up 且报得出协商速率时带上速率（「有线 1000M」），否则只写名字 */
+        if (!n->up) {
+            lv_label_set_text_fmt(s_ctx.lbl_net_if[row], "%s 未接入", name);
+        } else if (n->has_link && n->link_mbps > 0.0) {
+            lv_label_set_text_fmt(s_ctx.lbl_net_if[row], "%s %.0fM", name, n->link_mbps);
+        } else {
+            lv_label_set_text(s_ctx.lbl_net_if[row], name);
+        }
+
+        /* 速率：字段缺失单独显示 "--"，两个都缺时整行只留「--」 */
+        char rx[16];
+        char tx[16];
+        if (n->has_rx) {
+            format_rate_short(rx, sizeof(rx), n->rx_bytes_per_sec);
+        } else {
+            snprintf(rx, sizeof(rx), "--");
+        }
+        if (n->has_tx) {
+            format_rate_short(tx, sizeof(tx), n->tx_bytes_per_sec);
+        } else {
+            snprintf(tx, sizeof(tx), "--");
+        }
+        lv_label_set_text_fmt(s_ctx.lbl_net_rate[row], "↓%s ↑%s", rx, tx);
+
+        /* 颜色：down 整行用 STALE；能用的卡里当前上网那行用 ACCENT，另一行 MUTED */
+        const lv_color_t color = !n->up ? COLOR_STALE
+                                : netif_is_active(m, n) ? COLOR_ACCENT
+                                                        : COLOR_MUTED;
+        lv_obj_set_style_text_color(s_ctx.lbl_net_if[row], color, 0);
+        lv_obj_set_style_text_color(s_ctx.lbl_net_rate[row], color, 0);
+
+        lv_obj_remove_flag(s_ctx.lbl_net_if[row], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_ctx.lbl_net_rate[row], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+/** 新旧两套 label 互斥：new_style=true 露两行样式，false 露旧的 IP + ↓/↑ */
+static void net_card_use_if_style(bool new_style)
+{
+    lv_obj_t *old_labels[4] = {
+        s_ctx.lbl_mon_net_ip, s_ctx.lbl_mon_net_rx,
+        s_ctx.lbl_mon_net_tx, s_ctx.lbl_mon_net_note,
+    };
+    for (int i = 0; i < 4; i++) {
+        if (new_style) {
+            lv_obj_add_flag(old_labels[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(old_labels[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (!new_style) {
+        lv_obj_add_flag(s_ctx.lbl_net_active, LV_OBJ_FLAG_HIDDEN);
+        for (int i = 0; i < 2; i++) {
+            lv_obj_add_flag(s_ctx.lbl_net_if[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_ctx.lbl_net_rate[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
 /** 左下卡：优先网络（v3），没有就回落负载/运行时长 */
 static void apply_left_bottom(const device_metrics_t *m, bool fresh,
                               const device_status_t *st)
 {
     char buf[48];
-    const bool has_net = fresh && (m->has_net_rx || m->has_net_tx);
+    const bool has_net = fresh && (m->netifs_len > 0 || m->has_net_rx || m->has_net_tx);
 
     if (has_net) {
         lv_obj_remove_flag(s_ctx.card_net, LV_OBJ_FLAG_HIDDEN);
         lv_obj_add_flag(s_ctx.card_load, LV_OBJ_FLAG_HIDDEN);
 
+        /* v6 有分网卡明细：两行样式；否则（泰山派等 v5 设备）回落到旧单行 */
+        if (m->netifs_len > 0) {
+            net_card_use_if_style(true);
+            netif_active_text(m, buf, sizeof(buf));
+            lv_label_set_text(s_ctx.lbl_net_active, buf);
+            lv_obj_remove_flag(s_ctx.lbl_net_active, LV_OBJ_FLAG_HIDDEN);
+            apply_netif_rows(m);
+            return;
+        }
+
+        net_card_use_if_style(false);
         lv_label_set_text(s_ctx.lbl_mon_net_ip, st->ip[0] ? st->ip : "--");
         if (m->has_net_rx) {
             format_rate(buf, sizeof(buf), m->net_rx_bytes_per_sec);
@@ -953,59 +1202,66 @@ static void apply_bottom(const device_metrics_t *m, bool fresh)
         lv_label_set_text(s_ctx.val_mon_swap, "交换 --");
     }
 
-    /* ---- 磁盘主分区 ---- */
-    const bool has_disk = fresh && m->has_disk;
-    if (has_disk) {
-        snprintf(buf, sizeof(buf), "%.1f%%", m->disk_percent);
-        lv_label_set_text(s_ctx.val_mon_disk, buf);
-        if (!ui_format_bytes_pair(buf, sizeof(buf), m->disk_used_bytes, m->disk_total_bytes)) {
-            snprintf(buf, sizeof(buf), "已占用");
+    /* ---- 磁盘：最多三行（Windows 的 C/D/S，Linux 通常只有一行） ---- */
+    int rows = 0;
+    if (fresh) {
+        for (int i = 0; i < m->disks_len && rows < 3; i++) {
+            char path[24];
+            snprintf(path, sizeof(path), "%s", m->disks[i].path);
+            size_t n = strlen(path);
+            while (n > 1 && (path[n - 1] == '\\' || path[n - 1] == '/')) {
+                path[--n] = '\0';       /* "C:\\" → "C:"；单独的 "/" 保留 */
+            }
+            const double pct = m->disks[i].used_percent;
+            lv_label_set_text_fmt(s_ctx.lbl_disk_row[rows], "%s %.1f%%",
+                                  path[0] ? path : "?", pct);
+            if (!ui_format_bytes_pair(buf, sizeof(buf), m->disks[i].used_bytes,
+                                      m->disks[i].total_bytes)) {
+                snprintf(buf, sizeof(buf), "已占用");
+            }
+            lv_label_set_text(s_ctx.lbl_disk_val[rows], buf);
+            lv_obj_set_style_text_color(s_ctx.lbl_disk_row[rows],
+                                        pct >= 85.0 ? COLOR_ERR :
+                                        pct >= 70.0 ? COLOR_WARN : COLOR_TEXT, 0);
+            rows++;
         }
-        lv_label_set_text(s_ctx.det_mon_disk, buf);
-    } else {
-        lv_label_set_text(s_ctx.val_mon_disk, "--");
-        lv_label_set_text(s_ctx.det_mon_disk, placeholder_detail(m));
-    }
-    lv_obj_set_style_text_color(s_ctx.val_mon_disk,
-                                has_disk ? (m->disk_percent >= 85.0 ? COLOR_ERR :
-                                            m->disk_percent >= 70.0 ? COLOR_WARN : COLOR_TEXT)
-                                         : COLOR_STALE,
-                                0);
-
-    if (m->disk_path[0] != '\0') {
-        char title[48];
-        snprintf(title, sizeof(title), "磁盘 %s", m->disk_path);
-        lv_label_set_text(s_ctx.lbl_mon_disk_title, title);
-    } else {
-        lv_label_set_text(s_ctx.lbl_mon_disk_title, "磁盘");
+        /* 老设备没有 disks[]，退回单个 disk 对象，至少别显示空卡 */
+        if (rows == 0 && m->has_disk) {
+            lv_label_set_text_fmt(s_ctx.lbl_disk_row[0], "%s %.1f%%",
+                                  m->disk_path[0] ? m->disk_path : "磁盘",
+                                  m->disk_percent);
+            if (!ui_format_bytes_pair(buf, sizeof(buf), m->disk_used_bytes,
+                                      m->disk_total_bytes)) {
+                snprintf(buf, sizeof(buf), "已占用");
+            }
+            lv_label_set_text(s_ctx.lbl_disk_val[0], buf);
+            lv_obj_set_style_text_color(s_ctx.lbl_disk_row[0],
+                                        m->disk_percent >= 85.0 ? COLOR_ERR :
+                                        m->disk_percent >= 70.0 ? COLOR_WARN : COLOR_TEXT, 0);
+            rows = 1;
+        }
     }
 
-    /* ---- 其余分区：标题右侧「共 N 个分区」，底部列出除主分区外的占用率 ---- */
-    const bool has_parts = fresh && m->disks_len > 1;
-    if (has_parts) {
+    for (int i = 0; i < 3; i++) {
+        if (i < rows) {
+            lv_obj_remove_flag(s_ctx.lbl_disk_row[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(s_ctx.lbl_disk_val[i], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_ctx.lbl_disk_row[i], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_ctx.lbl_disk_val[i], LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
+    if (fresh && m->disks_len > 0) {
         char count[32];
-        snprintf(count, sizeof(count), "共 %u 个分区",
-                 (unsigned)m->disks_len);
+        snprintf(count, sizeof(count), "共 %u 个分区", (unsigned)m->disks_len);
         lv_label_set_text(s_ctx.lbl_disk_parts, count);
-
-        char line[64] = "";
-        size_t used = 0;
-        for (int i = 0; i < m->disks_len; i++) {
-            if (strcmp(m->disks[i].path, m->disk_path) == 0) {
-                continue;   /* 主分区已经用大字显示了 */
-            }
-            const int n = snprintf(line + used, sizeof(line) - used, "%s%.1f%%",
-                                   used ? "   " : "", m->disks[i].used_percent);
-            if (n <= 0 || used + (size_t)n >= sizeof(line)) {
-                break;
-            }
-            used += (size_t)n;
-        }
-        lv_label_set_text(s_ctx.det_disk_parts, line);
     } else {
         lv_label_set_text(s_ctx.lbl_disk_parts, "");
-        lv_label_set_text(s_ctx.det_disk_parts, "");
     }
+
+    /* 盘符已经逐行显示，标题固定写“磁盘”，避免出现“磁盘 C:\”这种重复 */
+    lv_label_set_text(s_ctx.lbl_mon_disk_title, "磁盘");
 }
 
 static void monitor_poll_cb(lv_timer_t *timer)

@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import json
+import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,6 +26,11 @@ from typing import NamedTuple, Optional
 
 if sys.platform != "win32":  # pragma: no cover - 只在 Windows 上跑
     raise RuntimeError("本模块只能在 Windows 上运行")
+
+# 挂在 windows_agent 的 logger 下：它的 handler / level 由 _setup_logging 配置，
+# 直接用 __name__（"metrics"）会走 root，最后只有 lastResort 打到 stderr，
+# 日志文件里看不到
+LOG = logging.getLogger("windows-agent.metrics")
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
@@ -317,25 +325,77 @@ def read_physical_cores() -> Optional[int]:
 
 # 这两类数据没有便宜的纯 ctypes 路径：
 #   - 每进程 CPU 要用 PDH / NtQuerySystemInformation，自己实现容易出错；
-#   - 网络速率同理。
+#   - 分网卡收发字节只有 NetTCPIP 模块（Get-NetAdapterStatistics）能给出。
 # 但「格式化性能计数器」每次要 5 s（Win32_PerfFormattedData 会遍历所有进程），
-# 撑不住 10 s 的刷新周期。所以改成采「累计值 + 自己差分」：
+# 撑不住 10 s 的刷新周期。所以一律采「累计值 + 自己差分」：
 #   - 进程：Get-Process 的 CPU（累计 CPU 秒）与 WorkingSet64，约 240 ms；
-#   - 网络：netstat -e 的累计收发字节，约 26 ms（比 Get-NetAdapterStatistics 的
-#     2.6 s 便宜两个数量级，且输出里的 "Bytes"/"字节" 行两种语言都能认）。
-# 差分由调用方做：同一份原始快照 + 上次采样时刻。
+#   - 网络：一次 PowerShell 同时取分网卡累计字节、链路信息与默认出口。
+#     Get-NetAdapterStatistics 实测约 2.6 s，因此 30 s 才跑一次并缓存
+#     （见 collect_network_interfaces）。
 _PS_PROCS = (
     "$p = Get-Process -ErrorAction SilentlyContinue; "
     "[pscustomobject]@{ count = $p.Count; items = @($p | "
     "Where-Object { $_.CPU -ne $null } | "
-    "Select-Object Name,CPU,WorkingSet64) } | ConvertTo-Json -Compress -Depth 3"
+    "Select-Object Name,CPU,PrivateMemorySize64) } | ConvertTo-Json -Compress -Depth 3"
 )
+
+# 任务管理器「内存」列是“私有工作集”。Get-Process 的 WorkingSet64 含共享页，
+# 同名多个进程会把同一批 DLL 重复计算（豆包 16 个进程能虚高近 1 GB）；而
+# PrivateMemorySize64 是提交量，又比实际驻留大约高 20%。这里用性能计数器取
+# 真正的私有工作集；一次约 3~4 s，所以 30 s 刷新一次并缓存。
+_PS_PRIVATE_WS = (
+    "$ErrorActionPreference = 'SilentlyContinue'; "
+    "$s = Get-Counter '\\Process(*)\\Working set - Private' -ErrorAction SilentlyContinue; "
+    "[pscustomobject]@{ samples = @($s.CounterSamples | ForEach-Object { "
+    "[pscustomobject]@{ name = $_.InstanceName; bytes = [double]$_.CookedValue } }) } | "
+    "ConvertTo-Json -Compress -Depth 3"
+)
+_PRIVATE_WS_TTL = 30.0
+_PRIVATE_WS = {"at": 0.0, "map": {}}
+
+
+def collect_private_ws() -> dict[str, int]:
+    """按进程名聚合私有工作集（字节），30 s 缓存。失败时沿用上一轮结果。"""
+    now = time.monotonic()
+    if now - float(_PRIVATE_WS["at"]) < _PRIVATE_WS_TTL:
+        return dict(_PRIVATE_WS["map"])
+
+    out = _run_powershell(_PS_PRIVATE_WS, timeout=12.0)
+    mapping: dict[str, int] = {}
+    if out:
+        try:
+            data = json.loads(out)
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            for item in data.get("samples") or []:
+                name = str(item.get("name") or "")
+                # 性能计数器的实例名一律小写，Get-Process 是原始大小写，
+                # 所以统一转小写当键；"_total" 也是小写，别只按 "_Total" 过滤。
+                base = name.split("#")[0].strip().lower()
+                if not base or base.startswith("_total") or base == "idle":
+                    continue
+                b = item.get("bytes")
+                if isinstance(b, (int, float)) and b > 0:
+                    mapping[base] = mapping.get(base, 0) + int(b)
+    if mapping:
+        _PRIVATE_WS["at"] = now
+        _PRIVATE_WS["map"] = mapping
+    return mapping or dict(_PRIVATE_WS["map"])
+
+
+
+def _powershell_exe() -> str:
+    """绝对路径优先：计划任务的 PATH 里不一定有 WindowsPowerShell\\v1.0。"""
+    p = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                     "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+    return p if os.path.exists(p) else "powershell.exe"
 
 
 def _run_powershell(script: str, timeout: float = 8.0) -> Optional[str]:
     try:
         proc = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-NonInteractive",
+            [_powershell_exe(), "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-Command", script],
             capture_output=True, text=True, timeout=timeout, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -347,50 +407,356 @@ def _run_powershell(script: str, timeout: float = 8.0) -> Optional[str]:
     return proc.stdout
 
 
-def read_net_totals() -> tuple[Optional[int], Optional[int]]:
-    """netstat -e 的累计收发字节。取不到返回 (None, None)。
+def _run_powershell_bytes(script: str, timeout: float) -> Optional[bytes]:
+    """先拿原始字节，由调用方决定编码。
 
-    坑：带 CREATE_NO_WINDOW 启动时，netstat 不会输出英文，而是按系统 OEM
-    代码页输出（中文机器是 GBK 的「字节」行）。按 UTF-8 解会变成乱码，
-    匹配不上任何行——所以这里用 encoding="oem"。
+    带 CREATE_NO_WINDOW 时不一定有控制台，脚本里设置 [Console]::OutputEncoding
+    可能失败；此时 PowerShell 按 OEM 代码页（中文机器是 GBK）输出。
+    解码时先按 UTF-8 严格解，失败再按 OEM 解，两条路都能拿到正确文本。
     """
     try:
         proc = subprocess.run(
-            ["netstat.exe", "-e"],
-            capture_output=True, text=True, timeout=5, check=False,
-            encoding="oem", errors="replace",
+            ["powershell.exe", "-NoProfile", "-NonInteractive",
+             "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, timeout=timeout, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (OSError, subprocess.SubprocessError):
-        return None, None
-    if proc.returncode != 0:
-        return None, None
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return proc.stdout
 
-    for line in proc.stdout.splitlines():
-        tokens = line.split()
-        # 英文系统 "Bytes 123 456"，中文系统 "字节 123 456"；
-        # 只认这一行，避免把 Unicast packets 之类也当成字节数
-        if len(tokens) >= 3 and tokens[0] in ("Bytes", "字节"):
-            try:
-                return int(tokens[1]), int(tokens[2])
-            except ValueError:
-                return None, None
-    return None, None
+
+def _decode_powershell_output(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("oem", errors="replace")
+
+
+# ---------------------------------------------------------------- 分网卡网络
+
+# 一次子进程同时取三样东西：
+#   1. Get-NetAdapterStatistics 的累计收发字节（速率靠两次采样差分）；
+#   2. Get-NetAdapter 的 ifIndex / 别名 / 物理介质 / 状态 / 链路速率；
+#   3. Find-NetRoute 到公网地址的出口 ifIndex（「当前上网卡」）。
+# Status / PhysicalMediaType 都是枚举，ConvertTo-Json 在 Windows PowerShell 5.1
+# 里会把枚举序列化成数字，所以显式转成字符串；LinkSpeed 是 "1 Gbps" 这种文本。
+# 中文网卡名要求输出走 UTF-8：设置 OutputEncoding 在无控制台时可能抛异常，
+# 用 try/catch 兜住（拿原始字节 + 双编码解码再兜一层，见 _decode_powershell_output）。
+_PS_NET = (
+    "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }; "
+    "$ErrorActionPreference = 'SilentlyContinue'; "
+    "$stats = @(Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes); "
+    "$adapters = @(Get-NetAdapter | Select-Object ifIndex,Name,"
+    "@{Name='PhysicalMediaType';Expression={[string]$_.PhysicalMediaType}},"
+    "@{Name='Status';Expression={[string]$_.Status}},LinkSpeed); "
+    "$active = $null; "
+    "foreach ($r in @(Find-NetRoute -RemoteIPAddress '223.5.5.5' -ErrorAction SilentlyContinue)) { "
+    "if ($null -ne $r.ifIndex) { $active = [int]$r.ifIndex; break }; "
+    "if ($null -ne $r.InterfaceIndex) { $active = [int]$r.InterfaceIndex; break } }; "
+    "[pscustomobject]@{ stats = $stats; adapters = $adapters; active = $active } | "
+    "ConvertTo-Json -Compress -Depth 4"
+)
+
+# PowerShell 要 2.6 s，30 s 刷新一次；速率至少隔 5 s 才有意义（差分噪声）
+_NET_REFRESH_SECONDS = 30.0
+_NET_MIN_SAMPLE_SECONDS = 5.0
+
+# PhysicalMediaType → 协议里的类型；Wireless WAN / Bluetooth 等一律不认
+_NET_PHYSICAL_TYPES = {"802.3": "wired", "native 802.11": "wifi"}
+# 名字里带这些字样的都是虚拟/隧道网卡，即使介质报 802.3 也不能当成上网卡
+_NET_VIRTUAL_HINTS = (
+    "vmware", "hyper-v", "vethernet", "tailscale",
+    "loopback", "bluetooth", "tap",
+)
+
+_LINK_SPEED_RE = re.compile(r"([\d.]+)\s*([KMGT]?)bps", re.IGNORECASE)
+_LINK_SPEED_UNITS = {"": 1e-6, "K": 1e-3, "M": 1.0, "G": 1e3, "T": 1e6}
+
+_NET_STATE: dict[str, object] = {
+    "next_try": float("-inf"),  # 下次允许跑 PowerShell 的时刻（30 s 节流）
+    "at": float("-inf"),        # 上次成功采样累计计数器的 monotonic 时刻
+    "counters": {},             # 别名 -> (rx 累计字节, tx 累计字节)
+    "rates": {},                # 别名 -> (rx B/s, tx B/s)
+    "result": {
+        "rx_bytes_per_sec": None, "tx_bytes_per_sec": None,
+        "interfaces": [], "active_id": None, "active_type": None,
+    },
+}
+_NET_WARNED = False        # 一次故障期内只记一条 warning，避免每 30 s 刷屏
+
+
+def _net_empty() -> dict[str, object]:
+    """采集失败的降级值：老字段与新字段都给空/null。"""
+    return {
+        "rx_bytes_per_sec": None,
+        "tx_bytes_per_sec": None,
+        "interfaces": [],
+        "active_id": None,
+        "active_type": None,
+    }
+
+
+def _copy_network(result: object) -> dict[str, object]:
+    """返回副本，调用方改它不会污染缓存（不可变约定）。"""
+    if not isinstance(result, dict):
+        return _net_empty()
+    raw_rows = result.get("interfaces")
+    rows = (
+        [dict(item) for item in raw_rows if isinstance(item, dict)]
+        if isinstance(raw_rows, list) else []
+    )
+    return {
+        "rx_bytes_per_sec": result.get("rx_bytes_per_sec"),
+        "tx_bytes_per_sec": result.get("tx_bytes_per_sec"),
+        "interfaces": rows,
+        "active_id": result.get("active_id"),
+        "active_type": result.get("active_type"),
+    }
+
+
+def _coerce_int(value: object) -> Optional[int]:
+    """JSON 数字 / 数字字符串 → int；None、布尔、'N/A' 一律给 None。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def _link_mbps(value: object) -> Optional[int]:
+    """LinkSpeed → Mbps。Get-NetAdapter 给 '1 Gbps' 这类文本；
+    直接来自 CIM 时可能是 bits/s 数字，两种都认。"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        mbps = float(value) / 1e6
+    else:
+        match = _LINK_SPEED_RE.search(str(value or ""))
+        if match is None:
+            return None
+        mbps = float(match.group(1)) * _LINK_SPEED_UNITS[match.group(2).upper()]
+    speed = int(round(mbps))
+    # 0 Mbps 在协议里表示「断开」，所以小数舍成 0 的一律按未知处理
+    return speed if speed > 0 else None
+
+
+def _warn_net_once(exc: BaseException) -> None:
+    global _NET_WARNED
+    if _NET_WARNED:
+        return
+    _NET_WARNED = True
+    LOG.warning("网卡指标采集失败，本轮 interfaces 为空（恢复前不再重复记录）：%s", exc)
+
+
+def _read_net_raw() -> dict[str, object]:
+    """跑一次 PowerShell；超时 / 无输出 / JSON 不合法都抛异常，由上层降级。"""
+    raw = _run_powershell_bytes(_PS_NET, timeout=20.0)
+    if raw is None:
+        raise RuntimeError("PowerShell 超时、退出码非 0 或没有输出")
+    data = json.loads(_decode_powershell_output(raw))
+    if not isinstance(data, dict):
+        raise ValueError("PowerShell 输出不是 JSON 对象")
+    return data
+
+
+def _rows(raw: object) -> list[dict[str, object]]:
+    """ConvertTo-Json 对单元素数组仍给数组，但这里再兜一层单对象情况。"""
+    if isinstance(raw, list):
+        return [row for row in raw if isinstance(row, dict)]
+    if isinstance(raw, dict):
+        return [raw]
+    return []
+
+
+def _diff_rates(prev_counters: dict, counters: dict,
+                elapsed: Optional[float], prev_rates: dict) -> dict:
+    """累计字节差 / 实际间隔 → B/s。
+
+    首次见到这张卡、计数器变小（网卡重启/系统重开）都给 null；
+    间隔不足 5 s 时沿用上一次的速率，避免把采样抖动放大成速率尖峰。
+    """
+    if elapsed is None or elapsed < _NET_MIN_SAMPLE_SECONDS:
+        return dict(prev_rates)
+
+    rates: dict[str, tuple[int, int]] = {}
+    for name, (rx, tx) in counters.items():
+        before = prev_counters.get(name)
+        if before is None:
+            continue
+        d_rx, d_tx = rx - before[0], tx - before[1]
+        if d_rx < 0 or d_tx < 0:
+            continue
+        rates[name] = (int(d_rx / elapsed), int(d_tx / elapsed))
+    return rates
+
+
+def _pick_adapter(candidates: list[dict[str, object]]) -> Optional[dict[str, object]]:
+    """同类里优先 Status=Up；全是断开的也保留第一张（由上层标 down / 0 Mbps）。"""
+    for row in candidates:
+        if row["status"] == "up":
+            return row
+    return candidates[0] if candidates else None
+
+
+def _build_network(raw: dict[str, object], now: float, prev_at: float,
+                   prev_counters: dict, prev_rates: dict
+                   ) -> tuple[dict[str, object], dict, dict]:
+    counters: dict[str, tuple[int, int]] = {}
+    for row in _rows(raw.get("stats")):
+        name = str(row.get("Name") or "").strip()
+        rx = _coerce_int(row.get("ReceivedBytes"))
+        tx = _coerce_int(row.get("SentBytes"))
+        if name and rx is not None and tx is not None:
+            counters[name] = (rx, tx)
+
+    by_index: dict[int, str] = {}
+    candidates: dict[str, list[dict[str, object]]] = {"wired": [], "wifi": []}
+    for row in _rows(raw.get("adapters")):
+        name = str(row.get("Name") or "").strip()
+        if not name:
+            continue
+        # 出口可能是虚拟网卡（例如 Tailscale），索引表必须建全，
+        # 过滤只影响 interfaces 列表，不影响 active_id 的解析
+        index = _coerce_int(row.get("ifIndex"))
+        if index is not None:
+            by_index[index] = name
+        if any(hint in name.lower() for hint in _NET_VIRTUAL_HINTS):
+            continue
+        media = str(row.get("PhysicalMediaType") or "").strip().lower()
+        kind = _NET_PHYSICAL_TYPES.get(media)
+        if kind is None:
+            continue
+        status = "up" if str(row.get("Status") or "").strip().lower() == "up" else "down"
+        candidates[kind].append({
+            "name": name,
+            "status": status,
+            "link": row.get("LinkSpeed"),
+        })
+
+    elapsed = now - prev_at if prev_counters else None
+    rates = _diff_rates(prev_counters, counters, elapsed, prev_rates)
+
+    interfaces: list[dict[str, object]] = []
+    for kind in ("wired", "wifi"):          # 有线在前，无线在后
+        chosen = _pick_adapter(candidates[kind])
+        if chosen is None:                  # 这类网卡一张都没有
+            continue
+        name = str(chosen["name"])
+        rx, tx = rates.get(name, (None, None))
+        interfaces.append({
+            "id": name,
+            "name": name,
+            "type": kind,
+            "status": chosen["status"],
+            # 断开的网卡没有协商速率；给 0 而不是 null，屏幕显示「未连接」
+            "link_mbps": 0 if chosen["status"] == "down"
+                          else _link_mbps(chosen["link"]),
+            "rx_bytes_per_sec": rx,
+            "tx_bytes_per_sec": tx,
+        })
+
+    active_index = _coerce_int(raw.get("active"))
+    active_id = by_index.get(active_index) if active_index is not None else None
+    if active_id is None:
+        active_type: Optional[str] = None
+    else:
+        types = {item["id"]: item["type"] for item in interfaces}
+        # 出口是虚拟网卡（VPN / Tailscale）时归为 other
+        active_type = types.get(active_id, "other")
+
+    # 旧界面的 network.rx/tx 现在表示「当前上网卡」的速率；
+    # 出口是虚拟网卡（不在 interfaces 里）或解析失败时给 null，不拿合计冒充
+    active_row = next((item for item in interfaces if item["id"] == active_id), None)
+    active_rx = active_row["rx_bytes_per_sec"] if active_row else None
+    active_tx = active_row["tx_bytes_per_sec"] if active_row else None
+
+    return (
+        {
+            "rx_bytes_per_sec": active_rx,
+            "tx_bytes_per_sec": active_tx,
+            "interfaces": interfaces,
+            "active_id": active_id,
+            "active_type": active_type,
+        },
+        counters,
+        rates,
+    )
+
+
+def collect_network_interfaces(force: bool = False) -> dict[str, object]:
+    """分网卡网络指标：物理有线 / 无线各一张 + 当前默认出口。
+
+    约 30 s 刷新一次并缓存（一次 PowerShell 约 2.6 s，不能跟着 10 s 的
+    进程采样跑）。任何失败都降级为 interfaces=[] / active_id=null，
+    绝不让网络问题把 CPU / GPU 等其它字段一起拖下水。
+    """
+    global _NET_WARNED
+
+    now = time.monotonic()
+    if not force and now < float(_NET_STATE["next_try"]):
+        return _copy_network(_NET_STATE["result"])
+
+    prev_at = float(_NET_STATE["at"])
+    prev_counters = _NET_STATE["counters"]
+    prev_rates = _NET_STATE["rates"]
+    if not isinstance(prev_counters, dict):
+        prev_counters = {}
+    if not isinstance(prev_rates, dict):
+        prev_rates = {}
+
+    try:
+        raw = _read_net_raw()
+        # 计数器是在子进程执行完时才读到的，用完成时刻算间隔，
+        # 否则会把 PowerShell 的 2.6 s 算进两次采样之间，速率偏高约 10%
+        sampled_at = time.monotonic()
+        result, counters, rates = _build_network(
+            raw, sampled_at, prev_at, prev_counters, prev_rates
+        )
+    except Exception as exc:  # noqa: BLE001 - 采集边界，异常不允许冒泡
+        # 清掉计数器：恢复后第一轮没有可比基线，给 null 而不是跨故障期算速率
+        _NET_STATE["counters"] = {}
+        _NET_STATE["rates"] = {}
+        _NET_STATE["result"] = _net_empty()
+        _warn_net_once(exc)
+        return _net_empty()
+    finally:
+        # 失败要等下一个 30 s 窗口再试，不每轮刷 warning / 起进程
+        _NET_STATE["next_try"] = time.monotonic() + _NET_REFRESH_SECONDS
+
+    if prev_counters and sampled_at - prev_at < _NET_MIN_SAMPLE_SECONDS:
+        # 间隔太短不重算：沿用上一轮的速率，也不移动差分基线，
+        # 这样下一次正常采样仍然覆盖完整窗口
+        _NET_STATE["result"] = result
+        _NET_WARNED = False
+        return _copy_network(result)
+
+    _NET_STATE["at"] = sampled_at
+    _NET_STATE["counters"] = counters
+    _NET_STATE["rates"] = rates
+    _NET_STATE["result"] = result
+    _NET_WARNED = False
+    return _copy_network(result)
 
 
 def sample_procnet() -> dict[str, object]:
-    """采一份原始快照（累计值，不是速率）。失败的部分保持空/None。"""
+    """采一份原始快照（进程是累计值；网络是分网卡速率缓存）。失败的部分保持空/None。"""
     result: dict[str, object] = {
         "processes": {},          # name -> {"cpu_seconds": float, "memory_bytes": int}
         "process_count": None,
-        "rx_total": None,
-        "tx_total": None,
+        "network": _net_empty(),
         "at": time.monotonic(),
     }
 
     out = _run_powershell(_PS_PROCS)
     if out is not None:
-        import json
         try:
             data = json.loads(out)
         except ValueError:
@@ -405,10 +771,18 @@ def sample_procnet() -> dict[str, object]:
                 if not name or not isinstance(cpu, (int, float)):
                     continue
                 mem = item.get("WorkingSet64")
-                procs[name] = {
-                    "cpu_seconds": float(cpu),
-                    "memory_bytes": int(mem) if isinstance(mem, (int, float)) else 0,
-                }
+                mem_bytes = int(mem) if isinstance(mem, (int, float)) else 0
+                # 同名多进程必须累加，不能覆盖：Doubao（16 个进程）、svchost（90+）
+                # 如果只留最后一个，排行会漏掉真正的大户，屏幕上永远看不到它们。
+                row = procs.get(name)
+                if row is None:
+                    procs[name] = {
+                        "cpu_seconds": float(cpu),
+                        "memory_bytes": mem_bytes,
+                    }
+                else:
+                    row["cpu_seconds"] += float(cpu)
+                    row["memory_bytes"] += mem_bytes
             result["processes"] = procs
             # 总数用 Get-Process 的总数量，而不是「有 CPU 值的那部分」：
             # 受保护进程读不到 CPU，但它们确实在跑，资源管理器也算进总数
@@ -417,9 +791,8 @@ def sample_procnet() -> dict[str, object]:
                 int(count) if isinstance(count, (int, float)) else len(procs)
             )
 
-    rx, tx = read_net_totals()
-    result["rx_total"] = rx
-    result["tx_total"] = tx
+    # 网络走自己的 30 s 缓存（见 collect_network_interfaces），失败时给空结构
+    result["network"] = collect_network_interfaces()
     return result
 
 
@@ -427,15 +800,17 @@ def derive_procnet(prev: Optional[dict[str, object]],
                    cur: dict[str, object],
                    cores: int,
                    top_n: int = 3) -> dict[str, object]:
-    """把两份累计快照差分成「进程 CPU% / 内存」和「网络收发速率」。
+    """把两份累计快照差分成「进程 CPU% / 内存」，网络部分直接取当前缓存。
 
-    首次采样（没有 prev）时，CPU% 与速率一律给 None —— 屏幕上显示 "--"，
-    不拿 0 冒充「这一刻真的没跑东西」。
+    首次采样（没有 prev）时，CPU% 一律给 None —— 屏幕上显示 "--"，
+    不拿 0 冒充「这一刻真的没跑东西」。网络速率不受这份 prev 影响：
+    它由 collect_network_interfaces 自己维护差分基线。
     """
+    network = _copy_network(cur.get("network"))
     empty = {
         "processes": [],
         "process_count": cur.get("process_count"),
-        "network": {"rx_bytes_per_sec": None, "tx_bytes_per_sec": None},
+        "network": network,
     }
     if prev is None:
         return empty
@@ -448,6 +823,9 @@ def derive_procnet(prev: Optional[dict[str, object]],
     cur_procs = cur.get("processes") or {}
     if not isinstance(prev_procs, dict) or not isinstance(cur_procs, dict) or not cur_procs:
         return empty
+
+    # 内存优先用私有工作集（和任务管理器同口径），取不到才退回 PrivateMemorySize64
+    ws_private = collect_private_ws()
 
     rows = []
     for name, info in cur_procs.items():
@@ -466,7 +844,7 @@ def derive_procnet(prev: Optional[dict[str, object]],
         rows.append({
             "name": name,
             "cpu_percent": round(pct, 1),
-            "memory_bytes": info.get("memory_bytes"),
+            "memory_bytes": ws_private.get(name.lower(), info.get("memory_bytes")),
         })
 
     # 按内存占用降序（同内存时 CPU 高的在前）
@@ -474,13 +852,6 @@ def derive_procnet(prev: Optional[dict[str, object]],
         float(r["memory_bytes"] or 0),
         float(r["cpu_percent"] or 0),
     ), reverse=True)
-
-    network = {"rx_bytes_per_sec": None, "tx_bytes_per_sec": None}
-    rx_now, tx_now = cur.get("rx_total"), cur.get("tx_total")
-    rx_before, tx_before = prev.get("rx_total"), prev.get("tx_total")
-    if None not in (rx_now, tx_now, rx_before, tx_before):
-        network["rx_bytes_per_sec"] = max(int(rx_now) - int(rx_before), 0) // int(elapsed)
-        network["tx_bytes_per_sec"] = max(int(tx_now) - int(tx_before), 0) // int(elapsed)
 
     return {
         "processes": rows[:top_n],

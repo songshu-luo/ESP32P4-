@@ -41,7 +41,7 @@ class AgentConfig:
     username: str
     password: str
     agent_version: str = "0.1.0"
-    schema_version: int = 1
+    schema_version: int = 5  # v5：metrics 增加 checks[]（任务状态）
 
     # 采样/发布节奏（秒）。数值来自 protocol/topics-v1.md §4.2。
     cpu_interval: float = 2.0
@@ -52,12 +52,20 @@ class AgentConfig:
     metrics_interval: float = 2.0
     status_interval: float = 5.0
     loop_tick: float = 0.5
+    # v5 任务状态：5 s 刷新一次；内部 docker ps 另有 15 s 缓存
+    checks_interval: float = 5.0
+    docker_cache_ttl: float = 15.0
+    # 任务状态检查项按设备类型分组：taishan（闲鱼/代理/ESP32/Tailscale/摄像头）
+    # 或 cloud（1Panel/OpenResty/Docker/Tailscale/New API）
+    checks_profile: str = "taishan"
 
     metrics_valid_for: int = 8
     status_valid_for: int = 15
 
     service_names: tuple[str, ...] = field(default_factory=lambda: ("mosquitto",))
     disk_path: str = "/"
+    # 需要上报的挂载点（屏幕磁盘卡逐行显示）；留空则只报 disk_path 一个
+    disk_paths: tuple[str, ...] = field(default_factory=lambda: ("/",))
 
     @property
     def status_topic(self) -> str:
@@ -85,14 +93,20 @@ def load_config(
     services_raw = values.get("HUB_SERVICES", "mosquitto")
     services = tuple(s.strip() for s in services_raw.split(",") if s.strip())
 
+    disk_paths_raw = values.get("HUB_DISK_PATHS", "")
+    disk_paths = tuple(s.strip() for s in disk_paths_raw.split(",") if s.strip())
+    disk_path = values.get("HUB_DISK_PATH", "/")
+
     return AgentConfig(
         device_id=values.get("HUB_DEVICE_ID", "taishan-3m"),
         broker_host=values.get("MOSQUITTO_HOST", "127.0.0.1"),
         broker_port=int(values.get("MOSQUITTO_PORT", "1883")),
-        username=required("TAISHAN_AGENT_USER"),
-        password=required("TAISHAN_AGENT_PASS"),
+        username=values.get("HUB_AGENT_USER") or required("TAISHAN_AGENT_USER"),
+        password=values.get("HUB_AGENT_PASS") or required("TAISHAN_AGENT_PASS"),
         service_names=services or ("mosquitto",),
-        disk_path=values.get("HUB_DISK_PATH", "/"),
+        disk_path=disk_path,
+        disk_paths=disk_paths or (disk_path,),
+        checks_profile=values.get("HUB_CHECKS_PROFILE", "taishan").strip() or "taishan",
     )
 
 

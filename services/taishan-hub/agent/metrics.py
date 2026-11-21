@@ -270,6 +270,345 @@ def read_fan() -> dict[str, object]:
     return {"pwm": None}
 
 
+# ---------------------------------------------------------------- 任务状态检查（schema v5）
+#
+# 五项固定检查，供屏幕右半列「任务状态」卡使用。每条独立求值、独立兜底：
+# 某一项采集失败只把自己标成 down，不能把整帧 metrics 打掉。
+# 状态取值：ok / warn / down（协议 §4.2 v5）。
+
+_DOCKER_CACHE_TTL = 15.0
+_docker_cache_at: float = -1e9
+_docker_cache_rows: Optional[list[tuple[str, str]]] = None
+
+
+def _docker_ps() -> Optional[list[tuple[str, str]]]:
+    """`docker ps` 快照 → [(容器名, Status)]；读不到 docker 时返回 None。
+
+    None 与空列表含义不同：None 是「读不到」（daemon 没起 / 不在 docker 组），
+    空列表是「docker 正常但一个运行中的容器都没有」。
+    """
+    import subprocess
+
+    try:
+        # 用 "|" 做分隔符，不用 "\t"：docker 的 --format 只对 {{}} 内的模板求值，
+        # 模板外的 \t 在不同版本上可能原样输出；容器名和 Status 里都不会出现 "|"。
+        proc = subprocess.run(
+            ["docker", "ps", "--format", "{{.Names}}|{{.Status}}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    rows: list[tuple[str, str]] = []
+    for line in proc.stdout.splitlines():
+        name, sep, status = line.partition("|")
+        name = name.strip()
+        if name:
+            rows.append((name, status.strip() if sep else ""))
+    return rows
+
+
+def read_docker_snapshot(ttl: float = _DOCKER_CACHE_TTL) -> Optional[list[tuple[str, str]]]:
+    """带 TTL 的 docker 快照。
+
+    `docker ps` 要起进程（约 30–60 ms），不能跟着 5 s 的检查节奏跑；
+    docker 本身的状态变化也远慢于 5 s，所以 15 s 缓存足够。
+    """
+    global _docker_cache_at, _docker_cache_rows
+
+    now = monotonic()
+    if now - _docker_cache_at < ttl:
+        return _docker_cache_rows
+    rows = _docker_ps()
+    _docker_cache_at = now
+    _docker_cache_rows = rows
+    return rows
+
+
+def _process_exists(name: str) -> bool:
+    """按 /proc/<pid>/comm 找进程，不调 ps。comm 最多 15 字节，mihomo 够用。"""
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        if (_read_text(f"/proc/{pid}/comm") or "").strip() == name:
+            return True
+    return False
+
+
+def _hex_ipv4(raw: str) -> str:
+    """/proc/net/tcp 的地址是小端 8 位十六进制，例如 0100007F → 127.0.0.1。"""
+    if len(raw) != 8:
+        return ""
+    try:
+        octets = [int(raw[i:i + 2], 16) for i in (6, 4, 2, 0)]
+    except ValueError:
+        return ""
+    return ".".join(str(o) for o in octets)
+
+
+def _tcp_entries() -> list[tuple[str, int, str, int, str]]:
+    """解析 /proc/net/tcp → [(本地IP, 本地端口, 对端IP, 对端端口, 状态)]。"""
+    text = _read_text("/proc/net/tcp")
+    if not text:
+        return []
+    entries: list[tuple[str, int, str, int, str]] = []
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        local, remote, state = parts[1], parts[2], parts[3]
+        lip, _, lport = local.partition(":")
+        rip, _, rport = remote.partition(":")
+        try:
+            entries.append((_hex_ipv4(lip), int(lport, 16),
+                            _hex_ipv4(rip), int(rport, 16), state))
+        except ValueError:
+            continue
+    return entries
+
+
+def _tcp_listening(host: str, port: int) -> bool:
+    """有 LISTEN（0A）状态且端口匹配的套接字。
+
+    绑在 0.0.0.0 上的监听同样能通过 127.0.0.1 访问（mihomo 两种绑定方式都见过），
+    所以通配地址也算数；只要求端口一致，避免把别的服务当成代理。
+    """
+    return any(lport == port and state == "0A" and lip in (host, "0.0.0.0")
+               for lip, lport, _rip, _rport, state in _tcp_entries())
+
+
+def _tcp_established_from(local_port: int, peer_ip: str) -> bool:
+    """本地端口有来自 peer_ip 的 ESTABLISHED 连接。"""
+    return any(lport == local_port and rip == peer_ip and state == "01"
+               for _lip, lport, rip, _rport, state in _tcp_entries())
+
+
+def _tailscale_backend_state() -> Optional[str]:
+    """`tailscale status --json` 的 BackendState；CLI 不可用或未运行时为 None。"""
+    import json
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    state = data.get("BackendState")
+    return state if isinstance(state, str) else None
+
+
+def _check(check_id: str, label: str, state: str, detail: str) -> dict[str, str]:
+    return {"id": check_id, "label": label, "state": state, "detail": detail}
+
+
+def _read_checks_cloud(
+    *,
+    docker_ttl: float = _DOCKER_CACHE_TTL,
+    tailscale_service: str = "tailscaled",
+    newapi_port: int = 3000,
+) -> list[dict[str, str]]:
+    """云服务器版五项任务状态：1Panel / OpenResty / Docker / Tailscale / New API。
+
+    和泰山派同一套协议：顺序固定、每项独立 try/except、始终返回 5 条。
+    """
+    checks: list[dict[str, str]] = []
+    rows = None
+    try:
+        rows = read_docker_snapshot(docker_ttl)
+    except Exception:  # noqa: BLE001
+        rows = None
+
+    def container_state(keyword: str) -> str | None:
+        """按容器名关键字找状态：'up' 视为在跑，healthy 另外标注。"""
+        if not rows:
+            return None
+        for name, status in rows:
+            if keyword.lower() in name.lower():
+                return (status or "").lower()
+        return None
+
+    # 1) 1Panel：systemd 单元或同名容器任一在跑（本机是容器化部署）
+    try:
+        unit_state = read_services(("1panel",)).get("1panel", "unknown")
+        cstate = container_state("1panel")
+        if unit_state == "active" or (cstate is not None and "up" in cstate):
+            checks.append(_check("1panel", "1Panel", "ok", "在线"))
+        else:
+            checks.append(_check("1panel", "1Panel", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("1panel", "1Panel", "down", "未检测到"))
+
+    # 2) OpenResty：单元或容器任一在跑
+    try:
+        unit_state = read_services(("openresty",)).get("openresty", "unknown")
+        cstate = container_state("openresty")
+        if unit_state == "active" or (cstate is not None and "up" in cstate):
+            checks.append(_check("openresty", "OpenResty", "ok", "在线"))
+        else:
+            checks.append(_check("openresty", "OpenResty", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("openresty", "OpenResty", "down", "未检测到"))
+
+    # 3) Docker：守护进程在跑，且 docker ps 读得到
+    try:
+        unit_state = read_services(("docker",)).get("docker", "unknown")
+        if unit_state == "active" and rows is not None:
+            checks.append(_check("docker", "Docker", "ok", "在线"))
+        elif unit_state == "active":
+            checks.append(_check("docker", "Docker", "warn", "未就绪"))
+        else:
+            checks.append(_check("docker", "Docker", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("docker", "Docker", "down", "未检测到"))
+
+    # 4) Tailscale：tailscaled 在跑，且 BackendState == Running
+    try:
+        unit_state = read_services((tailscale_service,)).get(tailscale_service, "unknown")
+        backend = _tailscale_backend_state() if unit_state == "active" else None
+        if unit_state == "active" and backend == "Running":
+            checks.append(_check("tailscale", "Tailscale", "ok", "在线"))
+        elif unit_state == "active":
+            checks.append(_check("tailscale", "Tailscale", "warn", "未连接"))
+        else:
+            checks.append(_check("tailscale", "Tailscale", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("tailscale", "Tailscale", "down", "未检测到"))
+
+    # 5) New API：容器在跑 + 3000 端口在监听
+    try:
+        cstate = container_state("new-api")
+        listening = _tcp_listening("127.0.0.1", newapi_port)
+        if cstate is not None and "up" in cstate and listening:
+            checks.append(_check("newapi", "New API", "ok", "在线"))
+        elif cstate is not None and "up" in cstate:
+            checks.append(_check("newapi", "New API", "warn", "未监听"))
+        else:
+            checks.append(_check("newapi", "New API", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("newapi", "New API", "down", "未检测到"))
+
+    return checks
+
+
+def read_checks(
+    *,
+    profile: str = "taishan",
+    docker_ttl: float = _DOCKER_CACHE_TTL,
+    xianyu_container: str = "ydisks-xianyu-helper-app-1",
+    proxy_process: str = "mihomo",
+    proxy_host: str = "127.0.0.1",
+    proxy_port: int = 7890,
+    mqtt_port: int = 1883,
+    esp32_ip: str = "192.168.0.100",
+    tailscale_service: str = "tailscaled",
+    camera_service: str = "rkaiq_3A",
+) -> list[dict[str, str]]:
+    """五项任务状态，顺序固定（屏幕按顺序显示）。
+
+    每项都包在 try/except 里：单项异常只影响自己，返回的列表长度始终是 5。
+    profile=cloud 时换成云服务器那一套检查项（见 _read_checks_cloud）。
+    """
+    if (profile or "").strip().lower() == "cloud":
+        return _read_checks_cloud(docker_ttl=docker_ttl,
+                                  tailscale_service=tailscale_service)
+
+    checks: list[dict[str, str]] = []
+
+    # 1) 闲鱼助手：容器在跑，且有 healthy 健康检查结果
+    try:
+        rows = read_docker_snapshot(docker_ttl)
+        status = next((s for n, s in rows or [] if n == xianyu_container), None)
+        if rows is None:
+            checks.append(_check("xianyu", "闲鱼助手", "down", "未检测到"))
+        elif status is None:
+            checks.append(_check("xianyu", "闲鱼助手", "down", "未运行"))
+        else:
+            lowered = status.lower()
+            if "health: starting" in lowered:
+                checks.append(_check("xianyu", "闲鱼助手", "warn", "运行中"))
+            elif "unhealthy" in lowered:
+                checks.append(_check("xianyu", "闲鱼助手", "warn", "不健康"))
+            elif "healthy" in lowered:
+                checks.append(_check("xianyu", "闲鱼助手", "ok", "在线"))
+            else:
+                # 没配 healthcheck：容器活着，但协议要求「运行且健康」，
+                # 无法证明健康就降一档，不能说成在线。
+                checks.append(_check("xianyu", "闲鱼助手", "warn", "运行中"))
+    except Exception:  # noqa: BLE001 - 单项失败不能拖垮整帧
+        checks.append(_check("xianyu", "闲鱼助手", "down", "未检测到"))
+
+    # 2) 网络代理：mihomo 进程存在 + 7890 正在监听
+    try:
+        running = _process_exists(proxy_process)
+        listening = _tcp_listening(proxy_host, proxy_port)
+        if running and listening:
+            checks.append(_check("proxy", "网络代理", "ok", "在线"))
+        elif running:
+            checks.append(_check("proxy", "网络代理", "warn", "未监听"))
+        else:
+            checks.append(_check("proxy", "网络代理", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("proxy", "网络代理", "down", "未检测到"))
+
+    # 3) ESP32 通信：1883 上有来自终端 IP 的 ESTABLISHED 连接
+    try:
+        if _tcp_established_from(mqtt_port, esp32_ip):
+            checks.append(_check("esp32", "ESP32通信", "ok", "在线"))
+        else:
+            checks.append(_check("esp32", "ESP32通信", "down", "未连接"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("esp32", "ESP32通信", "down", "未连接"))
+
+    # 4) Tailscale：tailscaled 在跑，且 BackendState == Running
+    try:
+        unit_state = read_services((tailscale_service,)).get(tailscale_service, "unknown")
+        backend = _tailscale_backend_state() if unit_state == "active" else None
+        if unit_state == "active" and backend == "Running":
+            checks.append(_check("tailscale", "Tailscale", "ok", "在线"))
+        elif unit_state == "active":
+            checks.append(_check("tailscale", "Tailscale", "warn", "未连接"))
+        else:
+            checks.append(_check("tailscale", "Tailscale", "down", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("tailscale", "Tailscale", "down", "未检测到"))
+
+    # 5) 摄像头：/dev/video* 存在 + rkaiq_3A 服务在跑
+    try:
+        import glob
+
+        has_dev = bool(glob.glob("/dev/video*"))
+        unit_state = read_services((camera_service,)).get(camera_service, "unknown")
+        if has_dev and unit_state == "active":
+            checks.append(_check("camera", "摄像头", "ok", "在线"))
+        elif not has_dev:
+            checks.append(_check("camera", "摄像头", "down", "未检测到"))
+        else:
+            checks.append(_check("camera", "摄像头", "warn", "未运行"))
+    except Exception:  # noqa: BLE001
+        checks.append(_check("camera", "摄像头", "down", "未检测到"))
+
+    return checks
+
+
 def local_ip_addresses(target: str = "192.168.0.1") -> list[str]:
     """取本机用于访问 `target` 的那张网卡的 IPv4。
 

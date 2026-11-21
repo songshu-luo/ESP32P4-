@@ -35,6 +35,7 @@ from metrics import (
     clock_synced,
     cpu_usage_percent,
     local_ip_addresses,
+    read_checks,
     read_core_count,
     read_cpu_sample,
     read_disk,
@@ -74,8 +75,10 @@ class MetricCache:
             "memory": {},
             "temperature": {},
             "disk": {},
+            "disks": [],
             "services": {},
             "fan": {},
+            "checks": [],
         }
 
     def _due(self, key: str, interval: float, now: float) -> bool:
@@ -108,10 +111,18 @@ class MetricCache:
 
         if self._due("disk", cfg.disk_interval, now):
             self._cache["disk"] = read_disk(cfg.disk_path)
+            self._cache["disks"] = [read_disk(p) for p in cfg.disk_paths]
 
         if self._due("services", cfg.services_interval, now):
             self._cache["services"] = read_services(cfg.service_names)
             self._cache["fan"] = read_fan()
+
+        if self._due("checks", cfg.checks_interval, now):
+            # read_checks 内部逐项 try/except，单项异常只会把自己标成 down，
+            # 不会抛出——这里不需要再包一层，也不能因为检查失败影响其它字段。
+            self._cache["checks"] = read_checks(
+                profile=cfg.checks_profile, docker_ttl=cfg.docker_cache_ttl
+            )
 
     def snapshot(self) -> dict[str, Any]:
         payload = dict(self._cache)

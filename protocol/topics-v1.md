@@ -11,6 +11,8 @@
 | 2 | metrics 增加可选对象 `gpu`（利用率、温度、显存）；其余字段含义不变 | 订阅方收 1 和 2 都合法；发布方发 2 后，只认 1 的老订阅方会丢帧 |
 | 3 | metrics 增加 `cpu.physical_cores`、`processes[]`/`process_count`、`network`、`disks[]`（`disk` 单对象保留为主分区） | 订阅方收 1–3 都合法 |
 | 4 | metrics 增加 `containers[]`/`container_count`（docker 运行中的容器） | 订阅方收 1–4 都合法；Linux 端发布 4，Windows 端仍发 3 |
+| 5 | metrics 增加 `checks[]`（5 项任务状态；泰山派=闲鱼助手/网络代理/ESP32通信/Tailscale/摄像头，云服务器=1Panel/OpenResty/Docker/Tailscale/New API） | 订阅方收 1–5 都合法；各节点按自己的 `HUB_CHECKS_PROFILE` 发布 5 条 |
+| 6 | metrics 的 `network` 增加 `interfaces[]` / `active_id` / `active_type`（分网卡监控 + 当前上网卡），旧 `rx/tx_bytes_per_sec` 语义改为“当前上网卡速率” | 订阅方收 1–6 都合法；Windows 发布 6，泰山派仍发 5 |
 
 ---
 
@@ -27,7 +29,7 @@ hub/v1/commands/results/{request_id}   控制结果回执（S3 起使用）
 |---|---|
 | `taishan-3m` | 泰山派 3M（RK3576 / Ubuntu），本地 Hub 宿主 |
 | `windows-main` | Windows 11（S4） |
-| `cloud-main` | 云服务器（S5） |
+| `cloud-main` | 云服务器（Tailscale 已接入，只读监控） |
 
 `device_id` 只允许 `[a-z0-9-]`，长度 ≤ 32。
 
@@ -61,7 +63,7 @@ hub/v1/commands/results/{request_id}   控制结果回执（S3 起使用）
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
-| `schema_version` | int | 当前为 `2`（订阅方须同时接受 `1`） |
+| `schema_version` | int | 当前最高为 `6`（订阅方须接受 `1`–`6`） |
 | `device_id` | string | 发布设备自身的 ID |
 | `timestamp_utc` | string | ISO-8601 UTC，秒级精度，以设备本地时钟为准 |
 | `message_id` | string | 设备内单调递增，用于去重与排查 |
@@ -206,6 +208,61 @@ LWT（Broker 代发）固定为：
 - 采集用 `docker ps --format`（约 30–60 ms），刷新周期 15 s；不调 `docker stats`（那要等一个采样周期，2 s 的发布节奏扛不住）。
 - 当前用户不在 docker 组、daemon 未启动、未装 docker，都只让 `container_count = null`，不报错、不影响其它字段。
 - 屏幕上 `containers` 只展示前 4 条；没有 GPU 的设备用它填右半列（有 GPU 的设备仍显示 GPU）。
+
+#### v5 新增字段（可选，缺失即视为未上报）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `checks` | array | 固定 5 条任务状态，顺序按设备 profile：泰山派为 闲鱼助手 / 网络代理 / ESP32通信 / Tailscale / 摄像头（`xianyu`/`proxy`/`esp32`/`tailscale`/`camera`），云服务器为 1Panel / OpenResty / Docker / Tailscale / New API（`1panel`/`openresty`/`docker`/`tailscale`/`newapi`）；每项含 `id`、`label`（中文名）、`state`（`ok`/`warn`/`down`）、`detail`（短说明） |
+
+```json
+"checks": [
+  { "id": "xianyu",     "label": "闲鱼助手",   "state": "ok",   "detail": "在线" },
+  { "id": "proxy",      "label": "网络代理",   "state": "ok",   "detail": "在线" },
+  { "id": "esp32",      "label": "ESP32通信",  "state": "ok",   "detail": "在线" },
+  { "id": "tailscale",  "label": "Tailscale",  "state": "ok",   "detail": "在线" },
+  { "id": "camera",     "label": "摄像头",     "state": "ok",   "detail": "在线" }
+]
+```
+
+约定：
+
+- `ok` = 正常；`warn` = 进程在但没就绪（如容器 unhealthy、代理未监听、Tailscale 未连上）；`down` = 未运行/未检测到。订阅方不得把 `warn` 显示成正常。
+- 判定来源：闲鱼容器 `docker ps` 的 healthy 状态；代理 = `mihomo` 进程 + `127.0.0.1:7890` 监听；ESP32通信 = `1883` 上存在来自 `192.168.0.100` 的 ESTABLISHED 连接；Tailscale = `tailscaled` active + `BackendState=Running`；摄像头 = `/dev/video*` 存在 + `rkaiq_3A` active。
+- 采集周期 5 s（docker 快照复用 15 s 缓存）；单项失败只影响自己，整帧照发。
+- `checks` 缺失或不是数组时，订阅方按「未上报」处理（屏幕显示“等待数据”），不得显示成 0 项或全绿。
+- 没有 GPU 的设备用 `checks` 填监控页右半列（原“运行容器”位置）；有 GPU 的设备仍显示 GPU，容器/任务状态不上屏。
+
+#### v6 新增字段（可选，缺失即回落到旧的单网卡样式）
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `network.interfaces` | array | 物理网卡，最多 2 条（有线、无线各 1 张）；每项 `id`（网卡别名，如 `以太网 5` / `WLAN`）、`type`（`wired`/`wifi`）、`status`（`up`/`down`）、`link_mbps`（协商速率，可空）、`rx_bytes_per_sec` / `tx_bytes_per_sec`（可空） |
+| `network.active_id` | string/null | 当前默认出口的网卡别名，对应 `interfaces[].id`；判定来源是 `Find-NetRoute` 到外网地址的 `ifIndex` |
+| `network.active_type` | string/null | `wired`/`wifi`/`other`/`null`；`active_id` 不在 `interfaces` 里（例如出口是 VPN 虚拟网卡）时为 `other` |
+
+```json
+"network": {
+  "rx_bytes_per_sec": 6792,
+  "tx_bytes_per_sec": 14528,
+  "interfaces": [
+    { "id": "以太网 5", "name": "以太网 5", "type": "wired", "status": "up",
+      "link_mbps": 1000, "rx_bytes_per_sec": 6792, "tx_bytes_per_sec": 14528 },
+    { "id": "WLAN", "name": "WLAN", "type": "wifi", "status": "down",
+      "link_mbps": 0, "rx_bytes_per_sec": 0, "tx_bytes_per_sec": 0 }
+  ],
+  "active_id": "以太网 5",
+  "active_type": "wired"
+}
+```
+
+约定：
+
+- 只报物理网卡：`PhysicalMediaType` 为 `802.3` 记 `wired`，`Native 802.11` 记 `wifi`；VMware / Hyper-V / vEthernet / Tailscale / Loopback / Bluetooth / TAP 一律排除。
+- 断开的那张卡也保留（`status=down`、`link_mbps=0`），屏幕显示“未接入”，不隐藏行。
+- 速率是每张卡各自的累计计数器差分；首次采样、计数器回绕给 `null`，不出现负值；采样间隔 30 s（一次 PowerShell 约 2–4 s，不能跟着 2 s 的发布节奏）。
+- `rx_bytes_per_sec` / `tx_bytes_per_sec` 保留是为了兼容只认旧字段的订阅方（v1–v5），其值等于 `active_id` 那张卡的速率；找不到出口时给 `null`，不拿全机合计冒充。
+- `interfaces` 缺失或为空数组时，订阅方回落到旧 ip + ↓/↑ 单行样式（泰山派 5 帧属于这一种）。
 
 
 

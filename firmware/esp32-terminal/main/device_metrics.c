@@ -180,6 +180,105 @@ static int flatten_services(const cJSON *root, device_metrics_t *dst)
     return stored;
 }
 
+/**
+ * 把 checks 数组摊平成定长数组。返回条数；checks 缺失或不是数组时返回 -1。
+ *
+ * 每条必须同时有 id 和 label 才算有效（id 给程序看，label 给屏上看，缺一个就
+ * 无法定位/显示）；state 缺失或不是 ok/warn/down 时按 UNKNOWN，不猜成 ok。
+ * detail 是可选的小字，读不到就留空串。
+ */
+static int flatten_checks(const cJSON *root, device_metrics_t *dst)
+{
+    const cJSON *checks = cJSON_GetObjectItemCaseSensitive(root, "checks");
+    if (!cJSON_IsArray(checks)) {
+        return -1;
+    }
+    int stored = 0;
+    int seen = 0;
+    for (const cJSON *c = checks->child; c != NULL; c = c->next) {
+        if (!cJSON_IsObject(c)) {
+            continue;
+        }
+        seen++;
+        if (stored >= DEVICE_METRICS_MAX_CHECKS) {
+            continue;   /* 协议只允许 5 条，多出来的丢弃 */
+        }
+        device_metrics_check_t *row = &dst->checks[stored];
+        if (!get_string(c, "id", row->id, sizeof(row->id)) ||
+            !get_string(c, "label", row->label, sizeof(row->label))) {
+            continue;   /* 没有 id/label 的项没法上屏 */
+        }
+        row->state = DEVICE_CHECK_UNKNOWN;
+        const cJSON *state = cJSON_GetObjectItemCaseSensitive(c, "state");
+        if (cJSON_IsString(state) && state->valuestring != NULL) {
+            if (strcmp(state->valuestring, "ok") == 0) {
+                row->state = DEVICE_CHECK_OK;
+            } else if (strcmp(state->valuestring, "warn") == 0) {
+                row->state = DEVICE_CHECK_WARN;
+            } else if (strcmp(state->valuestring, "down") == 0) {
+                row->state = DEVICE_CHECK_DOWN;
+            }
+            /* 其余字符串（拼错、协议新增状态）一律 UNKNOWN，UI 显示灰点 */
+        }
+        get_string(c, "detail", row->detail, sizeof(row->detail));
+        stored++;
+    }
+    /* 数组里确实有条目、却一条都没解析出来 → 按解析失败处理（-1），
+     * 和「数组为空」区分开；两种在 UI 上都显示「等待数据」。 */
+    if (seen > 0 && stored == 0) {
+        return -1;
+    }
+    return stored;
+}
+
+/**
+ * 把 network.interfaces 数组摊平成定长数组（v6）。返回存下的条数（0~2）。
+ *
+ * 每条必须同时有非空的 id 和 type 才算有效（id 用来和 active_id 对齐，type
+ * 决定显示有线还是无线图标）；status == "up" 才是 up，其余（含缺失）都按 down，
+ * 不猜成在线。link_mbps / 速率是可选数值，null 或缺失时对应的 has_* 保持 false。
+ * 不是数组时返回 0（UI 据此回落到旧字段）。
+ */
+static int flatten_netifs(const cJSON *network, device_metrics_t *dst)
+{
+    const cJSON *interfaces = cJSON_GetObjectItemCaseSensitive(network, "interfaces");
+    if (!cJSON_IsArray(interfaces)) {
+        return 0;
+    }
+    int stored = 0;
+    for (const cJSON *it = interfaces->child;
+         it != NULL && stored < DEVICE_METRICS_MAX_NETIFS;
+         it = it->next) {
+        if (!cJSON_IsObject(it)) {
+            continue;
+        }
+        device_metrics_netif_t *row = &dst->netifs[stored];
+        if (!get_string(it, "id", row->id, sizeof(row->id)) ||
+            !get_string(it, "type", row->type, sizeof(row->type))) {
+            continue;   /* 没有 id/type 的项没法定位或选图标，整条丢弃 */
+        }
+        const cJSON *status = cJSON_GetObjectItemCaseSensitive(it, "status");
+        row->up = cJSON_IsString(status) && status->valuestring != NULL &&
+                  strcmp(status->valuestring, "up") == 0;
+
+        double v = 0;
+        row->has_link = get_number(it, "link_mbps", &v) && v >= 0;
+        if (row->has_link) {
+            row->link_mbps = v;
+        }
+        row->has_rx = get_number(it, "rx_bytes_per_sec", &v) && v >= 0;
+        if (row->has_rx) {
+            row->rx_bytes_per_sec = v;
+        }
+        row->has_tx = get_number(it, "tx_bytes_per_sec", &v) && v >= 0;
+        if (row->has_tx) {
+            row->tx_bytes_per_sec = v;
+        }
+        stored++;
+    }
+    return stored;
+}
+
 /* ------------------------------------------------------------ 解析 */
 
 /** 把一帧 JSON 拆进 dst。返回 false 表示信封不合格，调用方不应采纳。 */
@@ -191,9 +290,10 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
         return false;
     }
     /* v2 加了 payload.gpu，v3 加了 processes/network/disks，v4 加了 containers，
-     * 旧字段含义一直没动，所以 1~4 都收；再高就不认识了，直接丢。 */
+     * v5 加了 checks（任务状态），v6 加了 network.interfaces / active_id / active_type；
+     * 旧字段含义一直没动，所以 1~6 都收；再高就不认识了，直接丢。 */
     const int schema = (int)ver->valuedouble;
-    if (schema < 1 || schema > 4) {
+    if (schema < 1 || schema > 6) {
         ESP_LOGW(TAG, "unsupported schema_version %d, frame dropped", schema);
         return false;
     }
@@ -316,7 +416,16 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
         dst->process_count = (int)proc_total;
     }
 
-    /* ---- 网络速率（v3；累计值差分得到，首帧可能是 null） ---- */
+    /* ---- 网络（v3；v6 起旧字段语义变成「当前上网卡」的单卡速率） ----
+     *
+     * v6 新增 fields 先清零：整份快照虽然是 memset 出来的，这里仍显式清一遍，
+     * 免得以后改成「就地更新 dst」时残留上一帧的网卡明细。 */
+    dst->netifs_len = 0;
+    memset(dst->netifs, 0, sizeof(dst->netifs));
+    dst->has_active = false;
+    dst->active_id[0] = '\0';
+    dst->active_type[0] = '\0';
+
     const cJSON *network = cJSON_GetObjectItemCaseSensitive(payload, "network");
     if (cJSON_IsObject(network)) {
         dst->has_net_rx = get_number(network, "rx_bytes_per_sec", &v) && v >= 0;
@@ -326,6 +435,22 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
         dst->has_net_tx = get_number(network, "tx_bytes_per_sec", &v) && v >= 0;
         if (dst->has_net_tx) {
             dst->net_tx_bytes_per_sec = v;
+        }
+
+        /* v6：分网卡明细 + 当前上网卡。两者都是可选的：v1–v5 帧里没有，
+         * 解析失败时 Agent 也会降级成 interfaces=[] / active_id=null。 */
+        dst->netifs_len = flatten_netifs(network, dst);
+
+        /* active_id / active_type 先读到临时缓冲，两者都拿到才一起写入：
+         * 缺一个就整体当「没有当前上网卡」（has_active=false、两字段留空串），
+         * 只有 id 没有 type 时 UI 也选不出有线 / 无线图标。 */
+        char active_id[DEVICE_METRICS_NETIF_ID_LEN];
+        char active_type[DEVICE_METRICS_NETIF_TYPE_LEN];
+        if (get_string(network, "active_id", active_id, sizeof(active_id)) &&
+            get_string(network, "active_type", active_type, sizeof(active_type))) {
+            memcpy(dst->active_id, active_id, sizeof(dst->active_id));
+            memcpy(dst->active_type, active_type, sizeof(dst->active_type));
+            dst->has_active = true;
         }
     }
 
@@ -375,6 +500,9 @@ static bool parse_envelope(const cJSON *root, device_metrics_t *dst)
     if (dst->has_container_count) {
         dst->container_count = (int)cont_total;
     }
+
+    /* ---- 任务状态（v5；缺失或不是数组时 checks_count = -1，UI 显示「等待数据」） ---- */
+    dst->checks_count = flatten_checks(payload, dst);
 
     /* ---- uptime ---- */
     dst->has_uptime = get_number(payload, "uptime_seconds", &v);
@@ -454,14 +582,15 @@ void device_metrics_on_message(const char *topic, int topic_len,
             if (next.has_gpu_temp)  { snprintf(temp, sizeof(temp), "%.0fC",  next.gpu_celsius); }
             snprintf(gpu, sizeof(gpu), "%s/%s", util, temp);
         }
-        ESP_LOGI(TAG, "device %d frame #%u  cpu %s  gpu %s  mem %s  soc %s  disk %s  proc %d/%d  net %d  disks %d  cont %d/%d",
+        ESP_LOGI(TAG, "device %d frame #%u  cpu %s  gpu %s  mem %s  soc %s  disk %s  proc %d/%d  net %d  disks %d  cont %d/%d  chk %d",
                  slot, (unsigned)next.frame_count, cpu, gpu, mem, soc, disk,
                  next.processes_len,
                  next.has_process_count ? (int)next.process_count : -1,
                  (next.has_net_rx || next.has_net_tx) ? 1 : 0,
                  next.disks_len,
                  next.containers_len,
-                 next.has_container_count ? (int)next.container_count : -1);
+                 next.has_container_count ? (int)next.container_count : -1,
+                 next.checks_count);
     }
 }
 

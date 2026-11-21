@@ -6,7 +6,7 @@
 #
 # 做什么：
 #   1. 建 /etc/taishan-hub（root:mosquitto 750）
-#   2. 生成四个账号的随机密码，写入 credentials.env（root 600）
+#   2. 生成五个账号的随机密码，写入 credentials.env（root 600）
 #   3. 写 mosquitto.passwd / mosquitto.acl
 #   4. 安装 conf.d/taishan-hub.conf
 #   5. 重启并验证：匿名被拒、taishan-agent 可发、esp32-terminal 只读
@@ -45,6 +45,8 @@ ESP32_USER=esp32-terminal
 ESP32_PASS=$(gen)
 WINDOWS_AGENT_USER=windows-agent
 WINDOWS_AGENT_PASS=$(gen)
+CLOUD_AGENT_USER=cloud-agent
+CLOUD_AGENT_PASS=$(gen)
 OPS_USER=ops
 OPS_PASS=$(gen)
 EOF
@@ -68,6 +70,8 @@ append_cred() {   # $1=变量名  $2=固定值（空串表示随机生成）
 }
 append_cred WINDOWS_AGENT_USER windows-agent
 append_cred WINDOWS_AGENT_PASS ""
+append_cred CLOUD_AGENT_USER cloud-agent
+append_cred CLOUD_AGENT_PASS ""
 
 # shellcheck disable=SC1090
 . "$CRED"
@@ -82,6 +86,7 @@ install -m 600 -o root -g root /dev/null "$PW_TMP"
 mosquitto_passwd -c -b "$PW_TMP" "$TAISHAN_AGENT_USER" "$TAISHAN_AGENT_PASS"
 mosquitto_passwd    -b "$PW_TMP" "$ESP32_USER"        "$ESP32_PASS"
 mosquitto_passwd    -b "$PW_TMP" "$WINDOWS_AGENT_USER" "$WINDOWS_AGENT_PASS"
+mosquitto_passwd    -b "$PW_TMP" "$CLOUD_AGENT_USER"   "$CLOUD_AGENT_PASS"
 mosquitto_passwd    -b "$PW_TMP" "$OPS_USER"          "$OPS_PASS"
 install -m 600 -o mosquitto -g mosquitto "$PW_TMP" "$HUB_DIR/mosquitto.passwd"
 rm -f "$PW_TMP"
@@ -172,6 +177,23 @@ if echo "$out" | grep -qi 'not authorized'; then
   echo "[OK] windows-agent 越权写被拒（ACL 生效）"
 else
   echo "[FAIL] windows-agent 越权写居然成功，ACL 没生效！输出：${out:-<空>}"
+  exit 1
+fi
+
+# 6f cloud-agent 只能写 cloud-main 的主题。
+if out=$(timeout 5 mosquitto_pub -V mqttv5 -h "$HOST" -u "$CLOUD_AGENT_USER" -P "$CLOUD_AGENT_PASS" \
+     -t hub/v1/devices/cloud-main/metrics -m '{"probe":5}' 2>&1); [ -n "$out" ]; then
+  echo "[FAIL] cloud-agent 发布报错：$out"
+  exit 1
+fi
+echo "[OK] cloud-agent 可发布 cloud-main metrics"
+
+out=$(timeout 5 mosquitto_pub -V mqttv5 -h "$HOST" -u "$CLOUD_AGENT_USER" -P "$CLOUD_AGENT_PASS" \
+     -t hub/v1/devices/taishan-3m/metrics -m '{"probe":6}' -q 1 2>&1 || true)
+if echo "$out" | grep -qi 'not authorized'; then
+  echo "[OK] cloud-agent 越权写被拒（ACL 生效）"
+else
+  echo "[FAIL] cloud-agent 越权写居然成功，ACL 没生效！输出：${out:-<空>}"
   exit 1
 fi
 

@@ -1,7 +1,7 @@
 /*
  * 总览页（S2-d 单设备 → S2-e 多设备）
  *
- * 布局：上半区 4 张「每设备一张」的摘要卡，下半区保留本机网络卡和 MQTT 卡。
+ * 布局：上半区 4 张「每设备一张」的摘要卡，下半区保留本机网络卡和实时时钟卡。
  * 摘要卡只回答「这台机器大概怎么样」：在线状态 + CPU + 内存；
  * 细节（温区、服务、磁盘）在监控页，用 ◀ ▶ 切换设备查看。
  *
@@ -15,19 +15,23 @@
 #include "app_ui_internal.h"
 
 #include <stdio.h>
+#include <time.h>
 
 #include "device_metrics.h"
 #include "device_registry.h"
 #include "device_status.h"
 #include "eth_link.h"
-#include "mqtt_link.h"
 
 #include "fonts/cjk_fonts.h"
 
 /* 轮询周期：数据 2 s 一帧、500 ms 轮询足够跟上，且过期判断及时 */
 #define METRICS_POLL_PERIOD_MS  (500)
 #define NET_POLL_PERIOD_MS      (500)
-#define MQTT_POLL_PERIOD_MS     (1000)
+#define CLOCK_POLL_PERIOD_MS    (1000)
+
+/* SNTP 没对时之前，time() 从 1970 起算。低于 2023-11 的时间一律当成「还没对上」，
+ * 屏幕上显示占位符而不是 1970 年 —— 后者会让人以为时钟坏了。 */
+#define CLOCK_VALID_EPOCH       ((time_t)1700000000)
 
 /* 上面四张设备卡：4×222 + 3×24 = 960，正好铺满 1024 减去左右 32 边距 */
 #define DEV_CARD_W      (222)
@@ -247,56 +251,50 @@ static void net_poll_cb(lv_timer_t *timer)
     net_apply(&st);
 }
 
-/* ---------------------------------------------------------------- MQTT */
+/* ---------------------------------------------------------------- 实时时钟 */
 
-/** 把 MQTT 状态机翻译成一行文字 + 颜色 */
-static void mqtt_apply(const mqtt_link_status_t *st)
-{
-    const char *text = "";
-    lv_color_t  color = COLOR_MUTED;
+/* 时钟只有这两个标签需要跨回调访问；页面常驻、只构建一次，
+ * 所以用文件级静态句柄即可，不必往 app_ui_internal.h 里加字段。 */
+static lv_obj_t *s_lbl_clock_time;
+static lv_obj_t *s_lbl_clock_date;
 
-    switch (st->state) {
-    case MQTT_LINK_IDLE:         text = "空闲";         color = COLOR_MUTED; break;
-    case MQTT_LINK_WAIT_IP:      text = "等待网络";     color = COLOR_MUTED; break;
-    case MQTT_LINK_RESOLVING:    text = "解析中";       color = COLOR_WARN;  break;
-    case MQTT_LINK_CONNECTING:   text = "连接中";       color = COLOR_WARN;  break;
-    case MQTT_LINK_SUBSCRIBING:  text = "订阅中";       color = COLOR_WARN;  break;
-    case MQTT_LINK_ONLINE:       text = "已连接";       color = COLOR_OK;    break;
-    case MQTT_LINK_DISCONNECTED: text = "已断开";       color = COLOR_WARN;  break;
-    case MQTT_LINK_AUTH_FAIL:    text = "认证失败";     color = COLOR_ERR;   break;
-    case MQTT_LINK_RESOLVE_FAIL: text = "找不到服务器"; color = COLOR_ERR;   break;
-    case MQTT_LINK_ERROR:        text = "MQTT 错误";    color = COLOR_ERR;   break;
-    default:                     text = "未知";         color = COLOR_MUTED; break;
-    }
-
-    lv_label_set_text(s_ctx.lbl_mqtt_state, text);
-    lv_obj_set_style_text_color(s_ctx.lbl_mqtt_state, color, 0);
-
-    /* 按主题拆开计数：只看总数分不清是 metrics 停了还是 status 停了 */
-    lv_label_set_text_fmt(s_ctx.lbl_mqtt_msg, "指标 %u   状态 %u",
-                          (unsigned)st->metrics_count, (unsigned)st->status_count);
-    char line[96];
-    const bool show_addr = (st->state == MQTT_LINK_ONLINE) ||
-                           (st->state == MQTT_LINK_SUBSCRIBING) ||
-                           (st->state == MQTT_LINK_CONNECTING);
-    if (show_addr && st->host[0] && st->ip[0]) {
-        snprintf(line, sizeof(line), "%s  %s", st->host, st->ip);
-    } else if (st->detail[0]) {
-        snprintf(line, sizeof(line), "%s", st->detail);
-    } else if (st->host[0] && st->ip[0]) {
-        snprintf(line, sizeof(line), "%s  %s", st->host, st->ip);
-    } else {
-        snprintf(line, sizeof(line), "服务器未解析");
-    }
-    lv_label_set_text(s_ctx.lbl_mqtt_detail, line);
-}
-
-static void mqtt_poll_cb(lv_timer_t *timer)
+static void clock_poll_cb(lv_timer_t *timer)
 {
     (void)timer;
-    mqtt_link_status_t st;
-    mqtt_link_get_status(&st);
-    mqtt_apply(&st);
+
+    const time_t now = time(NULL);
+    if (now < CLOCK_VALID_EPOCH) {
+        /* SNTP 还没同步：显示占位符，绝不显示 1970 */
+        lv_label_set_text(s_lbl_clock_time, "--:--:--");
+        lv_obj_set_style_text_color(s_lbl_clock_time, COLOR_STALE, 0);
+        lv_label_set_text(s_lbl_clock_date, "对时中");
+        return;
+    }
+
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);   /* 时区由 main.c 里的 setenv(TZ, CST-8) 决定 */
+
+    static const char *const WEEKDAY[] = {
+        "日", "一", "二", "三", "四", "五", "六",
+    };
+
+    char line[32];
+    snprintf(line, sizeof(line), "%02d:%02d:%02d",
+             tm_now.tm_hour, tm_now.tm_min, tm_now.tm_sec);
+    lv_label_set_text(s_lbl_clock_time, line);
+    lv_obj_set_style_text_color(s_lbl_clock_time, COLOR_ACCENT, 0);
+
+    /* 日期和星期分两步拼接：%04d 在 tm_year 异常时可能展开成负数，
+     * 编译器会按「最长整数」估算 %04d 的宽度并对 32 字节缓冲报截断告警。
+     * 先落 16 字节日期串，再拼星期，宽度就确定了。 */
+    char date[16];
+    snprintf(date, sizeof(date), "%04u-%02u-%02u",
+             (unsigned)(tm_now.tm_year + 1900),
+             (unsigned)(tm_now.tm_mon + 1),
+             (unsigned)tm_now.tm_mday);
+    snprintf(line, sizeof(line), "%s 星期%s", date,
+             WEEKDAY[tm_now.tm_wday % 7]);
+    lv_label_set_text(s_lbl_clock_date, line);
 }
 
 /* ---------------------------------------------------------------- 页面构建 */
@@ -326,30 +324,27 @@ void ui_page_overview_build(lv_obj_t *page)
     s_ctx.lbl_net_detail = ui_label(card_net, &lv_font_cjk_16, COLOR_MUTED, "未启动");
     lv_obj_align(s_ctx.lbl_net_detail, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
-    /* ---- 底部右：MQTT 链路 ---- */
-    lv_obj_t *card_mqtt = ui_card(page, 468, 150);
-    lv_obj_align(card_mqtt, LV_ALIGN_BOTTOM_RIGHT, -32, -24);
+    /* ---- 底部右：实时时钟（沿用原 MQTT 卡那一格） ---- */
+    lv_obj_t *card_clock = ui_card(page, 468, 150);
+    lv_obj_align(card_clock, LV_ALIGN_BOTTOM_RIGHT, -32, -24);
 
-    lv_obj_t *mqtt_title = ui_label(card_mqtt, &lv_font_cjk_16, COLOR_MUTED, "MQTT 服务器");
-    lv_obj_set_pos(mqtt_title, 0, 0);
+    lv_obj_t *clock_title = ui_label(card_clock, &lv_font_cjk_16, COLOR_MUTED, "当前时间");
+    lv_obj_set_pos(clock_title, 0, 0);
 
-    s_ctx.lbl_mqtt_state = ui_label(card_mqtt, &lv_font_cjk_20, COLOR_MUTED, "空闲");
-    lv_obj_set_pos(s_ctx.lbl_mqtt_state, 0, 24);
+    /* HH:MM:SS 全是 ASCII，cjk_28 里本来就是完整的 0x20-0x7f 子集 */
+    s_lbl_clock_time = ui_label(card_clock, &lv_font_cjk_28, COLOR_STALE, "--:--:--");
+    lv_obj_set_pos(s_lbl_clock_time, 0, 24);
 
-    s_ctx.lbl_mqtt_msg = ui_label(card_mqtt, &lv_font_cjk_28, COLOR_TEXT, "指标 0   状态 0");
-    lv_obj_set_pos(s_ctx.lbl_mqtt_msg, 0, 52);
-
-    s_ctx.lbl_mqtt_detail = ui_label(card_mqtt, &lv_font_cjk_16, COLOR_MUTED,
-                                     "服务器未解析");
-    lv_obj_align(s_ctx.lbl_mqtt_detail, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    s_lbl_clock_date = ui_label(card_clock, &lv_font_cjk_16, COLOR_MUTED, "对时中");
+    lv_obj_align(s_lbl_clock_date, LV_ALIGN_BOTTOM_LEFT, 0, 0);
 
     /* ---- 定时器 ---- */
     lv_timer_create(devices_poll_cb, METRICS_POLL_PERIOD_MS, NULL);
     lv_timer_create(net_poll_cb, NET_POLL_PERIOD_MS, NULL);
-    lv_timer_create(mqtt_poll_cb, MQTT_POLL_PERIOD_MS, NULL);
+    lv_timer_create(clock_poll_cb, CLOCK_POLL_PERIOD_MS, NULL);
 
     /* 首帧就填上真实状态，避免开机先闪一下占位文字 */
     devices_poll_cb(NULL);
     net_poll_cb(NULL);
-    mqtt_poll_cb(NULL);
+    clock_poll_cb(NULL);
 }
