@@ -18,8 +18,12 @@
 #include "esp_flash.h"
 #include "esp_heap_caps.h"
 #include "esp_psram.h"
+#include "esp_sntp.h"
 
 #include "bsp/esp-bsp.h"
+
+#include <stdlib.h>
+#include <time.h>
 
 #include "app_ui.h"
 #include "device_metrics.h"
@@ -27,11 +31,37 @@
 #include "device_status.h"
 #include "eth_link.h"
 #include "mqtt_link.h"
+#include "ota_update.h"
+#include "ota_web.h"
 
 static const char *TAG = "app_main";
 
 /* 背光默认亮度（%）。调低便于长时间调试时观察，也便于判断亮度接口是否生效。 */
 #define APP_BACKLIGHT_PERCENT   (80)
+
+/* 本机时区：CST-8 = 中国标准时间 UTC+8（POSIX TZ 的符号与直觉相反，负号表示东八区） */
+#define APP_TZ              "CST-8"
+/* 局域网里的 Hub（泰山派）同时跑 chrony/ntpd，用它当首选 NTP 服务器，不依赖外网 */
+#define APP_NTP_SERVER      "192.168.0.156"
+
+/**
+ * 启动 SNTP 对时（非阻塞）。
+ *
+ * 只做三件事：设时区、设服务器、开轮询。esp_sntp_init() 起的是 lwip 里的
+ * 后台任务，不会等待第一次同步完成，所以放在 UI 起来之后调用也不影响启动。
+ * 屏幕上的时钟卡自己判断 time() 是否已过 2023-11，没对上就显示「对时中」。
+ */
+static void sntp_start(void)
+{
+    setenv("TZ", APP_TZ, 1);
+    tzset();
+
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, APP_NTP_SERVER);
+    esp_sntp_init();
+
+    ESP_LOGI(TAG, "sntp polling started, server %s, tz %s", APP_NTP_SERVER, APP_TZ);
+}
 
 static void log_board_info(void)
 {
@@ -54,6 +84,16 @@ static void log_board_info(void)
     ESP_LOGI(TAG, "lcd       : %dx%d  EK79007  touch GT911",
              (int)BSP_LCD_H_RES, (int)BSP_LCD_V_RES);
     ESP_LOGI(TAG, "============================================");
+}
+
+static void ota_mqtt_data_cb(const char *topic, int topic_len,
+                             const char *data, int data_len)
+{
+    (void)topic;
+    (void)topic_len;
+    (void)data;
+    (void)data_len;
+    ota_update_on_mqtt_data();
 }
 
 void app_main(void)
@@ -85,6 +125,12 @@ void app_main(void)
     /* 先建界面再开背光：避免用户先看到一片未初始化的花屏 */
     ESP_ERROR_CHECK(bsp_display_brightness_set(APP_BACKLIGHT_PERCENT));
 
+    /* OTA 状态机必须在 MQTT 开始收包前初始化，否则首帧无法确认新固件 */
+    esp_err_t ota_err = ota_update_init();
+    if (ota_err != ESP_OK) {
+        ESP_LOGE(TAG, "ota update init failed: %s", esp_err_to_name(ota_err));
+    }
+
     /* 网络在后台任务里起来，屏幕立刻可用；IP 会在界面底部自动出现 */
     esp_err_t err = eth_link_start_async();
     if (err != ESP_OK) {
@@ -92,6 +138,16 @@ void app_main(void)
     } else {
         ESP_LOGI(TAG, "ethernet starting in background (RJ45 needed for link)");
     }
+
+    /* OTA 网页也等以太网拿到 IP 后再启动，不阻塞这里 */
+    ota_err = ota_web_start_async();
+    if (ota_err != ESP_OK) {
+        ESP_LOGE(TAG, "ota web start failed: %s", esp_err_to_name(ota_err));
+    }
+
+    /* SNTP 依赖 lwip 网络栈（已在以太网启动前初始化），这里只是开一个后台轮询，
+     * 不等待同步完成，因此不会拖慢后面的 UI 或 MQTT 启动。 */
+    sntp_start();
 
     /* MQTT 也自己等以太网就绪，所以这里紧接着启动即可，不会互相阻塞 */
     err = mqtt_link_start_async();
@@ -110,7 +166,9 @@ void app_main(void)
         } else {
             mqtt_link_add_data_cb(device_metrics_on_message);
             mqtt_link_add_data_cb(device_status_on_message);
+            mqtt_link_add_data_cb(ota_mqtt_data_cb);
             ESP_LOGI(TAG, "parsers ready: registry + metrics + status hooked to mqtt data events");
+            ESP_LOGI(TAG, "ota rollback probe hooked to first mqtt data");
         }
     }
     if (err != ESP_OK) {

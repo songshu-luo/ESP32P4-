@@ -16,3 +16,8 @@ mosquitto.passwd
 # 各 Agent 的本地配置（含真实 MQTT 密码）
 **/windows-agent.env
 **/*agent.env.bak
+
+# 本地临时备份与 Python 缓存
+*.bak-*
+__pycache__/
+*.pyc

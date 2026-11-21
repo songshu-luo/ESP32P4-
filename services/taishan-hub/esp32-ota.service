@@ -1,0 +1,18 @@
+[Unit]
+Description=ESP32 OTA firmware HTTP server
+Documentation=file:///home/lckfb/esp32-ota/README.txt
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lckfb
+WorkingDirectory=/home/lckfb/esp32-ota
+ExecStart=/usr/bin/python3 -m http.server 8080 --bind 0.0.0.0 --directory /home/lckfb/esp32-ota
+Restart=always
+RestartSec=3
+UMask=0022
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
