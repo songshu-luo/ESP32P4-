@@ -28,6 +28,7 @@
 
 #include <stdio.h>
 
+#include "app_settings.h"
 #include "device_registry.h"
 #include "device_status.h"
 #include "mqtt_link.h"
@@ -51,18 +52,12 @@ app_ui_ctx_t s_ctx;
 int s_mon_slot = 0;
 
 /* 页面顺序即页签顺序。
- * 控制页已按需求去掉——这块板子现在只负责「看」，不提供任何控制入口。 */
-static void page_settings_stub(lv_obj_t *page)
-{
-    ui_page_placeholder_build(page, "设置页",
-                              "修改 broker 地址、凭据与设备参数需要固件重配，"
-                              "本阶段只读展示，不提供服务端写入。");
-}
-
+ * 控制页已按需求去掉——这块板子现在只负责「看」，不提供任何控制入口。
+ * 设置页（S7）从占位页换成真实实现，页序保持 总览 / 监控 / 设置。 */
 static const page_def_t PAGES[] = {
     { "总览", ui_page_overview_build },
     { "监控", ui_page_monitor_build },
-    { "设置", page_settings_stub },
+    { "设置", ui_page_settings_build },
 };
 
 #define PAGE_COUNT  ((int)(sizeof(PAGES) / sizeof(PAGES[0])))
@@ -330,6 +325,10 @@ static void status_poll_cb(lv_timer_t *timer)
     } else {
         lv_obj_add_flag(s_ctx.lbl_clock_warn, LV_OBJ_FLAG_HIDDEN);
     }
+
+    /* 息屏 / 唤醒统一在这里驱动：LVGL 定时器已经在跑，不需要再建一个。
+     * 这一步只读「无操作时长」，不碰任何跨任务共享状态。 */
+    app_settings_tick();
 }
 
 /* ---------------------------------------------------------------- 界面构建 */

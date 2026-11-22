@@ -1,4 +1,5 @@
 idf_component_register(SRCS "main.c" "app_ui.c" "ui_page_overview.c" "ui_page_monitor.c"
+                            "ui_page_settings.c" "app_settings.c" "log_ring.c"
                             "ui_page_placeholder.c"
                             "eth_link.c" "mqtt_link.c" "device_registry.c" "device_metrics.c" "device_status.c"
                             "ota_update.c" "ota_web.c"

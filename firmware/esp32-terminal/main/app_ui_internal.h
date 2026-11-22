@@ -155,4 +155,5 @@ bool ui_format_bytes_pair(char *buf, size_t len, double used, double total);
 /* 页面构建（每个页面自己往传进来的 page 里塞控件） */
 void ui_page_overview_build(lv_obj_t *page);
 void ui_page_monitor_build(lv_obj_t *page);
+void ui_page_settings_build(lv_obj_t *page);
 void ui_page_placeholder_build(lv_obj_t *page, const char *title, const char *note);

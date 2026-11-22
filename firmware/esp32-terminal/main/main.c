@@ -25,11 +25,13 @@
 #include <stdlib.h>
 #include <time.h>
 
+#include "app_settings.h"
 #include "app_ui.h"
 #include "device_metrics.h"
 #include "device_registry.h"
 #include "device_status.h"
 #include "eth_link.h"
+#include "log_ring.h"
 #include "mqtt_link.h"
 #include "ota_update.h"
 #include "ota_web.h"
@@ -98,6 +100,10 @@ static void ota_mqtt_data_cb(const char *topic, int topic_len,
 
 void app_main(void)
 {
+    /* 日志钩子必须最先安装：log_board_info() 的板级信息也要进环形缓冲，
+     * 设置页的「诊断日志」才有启动早期的内容可看。 */
+    log_ring_init();
+
     log_board_info();
 
     ESP_LOGI(TAG, "starting LVGL display");
@@ -107,6 +113,12 @@ void app_main(void)
          * 不 assert，让串口日志能完整打印出来。 */
         ESP_LOGE(TAG, "bsp_display_start() failed - check MIPI FPC, LCD 5V and panel type");
         return;
+    }
+
+    /* 设置页与 status_poll_cb 都要读这些状态，必须在建界面之前初始化 */
+    esp_err_t settings_err = app_settings_init();
+    if (settings_err != ESP_OK) {
+        ESP_LOGE(TAG, "app settings init failed: %s", esp_err_to_name(settings_err));
     }
 
     ESP_LOGI(TAG, "building UI");
