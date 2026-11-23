@@ -27,6 +27,7 @@
 
 #include "app_settings.h"
 #include "app_ui.h"
+#include "ui_screensaver.h"
 #include "device_metrics.h"
 #include "device_registry.h"
 #include "device_status.h"
@@ -127,6 +128,8 @@ void app_main(void)
         return;
     }
     app_ui_build(disp);
+    /* 休眠壁纸层：LVGL 锁区内、页面建好之后创建，默认隐藏 */
+    ui_screensaver_init();
     bsp_display_unlock();
 
     /* 触摸句柄自检：TAP ME 能响应说明触摸驱动已工作，

@@ -23,8 +23,8 @@
 /** 默认亮度（%）：与 main.c 的初始背光一致 */
 #define APP_SETTINGS_DEFAULT_BRIGHTNESS   (80)
 
-/** 息屏时的背光（%）。不用 0：全黑会被当成死机，3% 还能看见「轻触唤醒」 */
-#define APP_SETTINGS_DIM_BRIGHTNESS       (3)
+/** 息屏时的背光（%）。不用 0：全黑会被当成死机，30% 配合休眠壁纸仍能看见提示 */
+#define APP_SETTINGS_DIM_BRIGHTNESS       (30)
 
 /**
  * @brief 初始化设置模块（创建互斥量、恢复默认值）

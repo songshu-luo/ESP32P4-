@@ -21,6 +21,8 @@
 
 #include "app_settings.h"
 
+#include "ui_screensaver.h"
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 
@@ -139,6 +141,7 @@ void app_settings_set_dim_timeout(uint32_t ms)
 
     if (wake) {
         bsp_display_brightness_set(restore);
+        ui_screensaver_hide();
     }
 }
 
@@ -212,7 +215,9 @@ void app_settings_tick(void)
     /* 硬件操作放在锁外，缩短临界区；LEDC 写入本身不阻塞 */
     if (dim) {
         bsp_display_brightness_set(APP_SETTINGS_DIM_BRIGHTNESS);
+        ui_screensaver_show();
     } else if (wake) {
         bsp_display_brightness_set(restore);
+        ui_screensaver_hide();
     }
 }
