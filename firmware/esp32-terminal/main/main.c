@@ -28,6 +28,7 @@
 #include "app_settings.h"
 #include "app_ui.h"
 #include "ui_screensaver.h"
+#include "wall_sd.h"
 #include "device_metrics.h"
 #include "device_registry.h"
 #include "device_status.h"
@@ -131,6 +132,9 @@ void app_main(void)
     /* 休眠壁纸层：LVGL 锁区内、页面建好之后创建，默认隐藏 */
     ui_screensaver_init();
     bsp_display_unlock();
+
+    /* 放在解锁后，避免 init 里的 SD 挂载/解码长时间占着 LVGL 锁 */
+    wall_sd_init();
 
     /* 触摸句柄自检：TAP ME 能响应说明触摸驱动已工作，
      * 这里只把句柄是否被 BSP 记录下来打到日志，便于排查。 */

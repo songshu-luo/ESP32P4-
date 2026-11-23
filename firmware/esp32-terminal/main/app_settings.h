@@ -50,9 +50,18 @@ uint32_t app_settings_get_dim_timeout(void);
 bool app_settings_is_dimmed(void);
 
 /**
+ * @brief 立即从息屏状态唤醒（幂等；未息屏时什么都不做）
+ *
+ * 供休眠壁纸层在 LV_EVENT_PRESSED 里调用：壁纸层吞掉触摸后不会再让页面
+ * 收到事件，但唤醒不能等 500 ms 的 tick，所以这里做成同步接口。
+ * 唤醒动作：隐藏壁纸、恢复用户亮度、清掉 s_dimmed。
+ */
+void app_settings_wake_now(void);
+
+/**
  * @brief 由 UI 的 500 ms 定时器调用
  *
- * 逻辑见 app_settings.c：超过 timeout 没有触摸就降到 3%，
- * 息屏后检测到无操作时长回落（有新输入把它归零）就恢复到用户亮度。
+ * 逻辑见 app_settings.c：超过 timeout 没有触摸就显示休眠壁纸并把背光降到
+ * 30%，息屏后检测到无操作时长回落（有新输入把它归零）就恢复到用户亮度。
  */
 void app_settings_tick(void);

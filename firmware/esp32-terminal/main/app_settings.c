@@ -22,6 +22,7 @@
 #include "app_settings.h"
 
 #include "ui_screensaver.h"
+#include "wall_sd.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -142,6 +143,7 @@ void app_settings_set_dim_timeout(uint32_t ms)
     if (wake) {
         bsp_display_brightness_set(restore);
         ui_screensaver_hide();
+        wall_sd_prime();
     }
 }
 
@@ -216,8 +218,45 @@ void app_settings_tick(void)
     if (dim) {
         bsp_display_brightness_set(APP_SETTINGS_DIM_BRIGHTNESS);
         ui_screensaver_show();
+        /* 已在 LVGL 锁内（tick 由 UI 定时器调用），这里不再加锁；
+         * 有就绪的 SD 图就换源，没有就继续用内置图。 */
+        const lv_image_dsc_t *wall = wall_sd_take_ready();
+        if (wall) {
+            ui_screensaver_set_src(wall);
+        }
     } else if (wake) {
         bsp_display_brightness_set(restore);
         ui_screensaver_hide();
+        wall_sd_prime();
     }
+}
+
+void app_settings_wake_now(void)
+{
+    bool was_dimmed = false;
+    int  restore    = APP_SETTINGS_DEFAULT_BRIGHTNESS;
+
+    if (s_lock != NULL && xSemaphoreTake(s_lock, 0) == pdTRUE) {
+        was_dimmed = s_dimmed;
+        if (was_dimmed) {
+            s_dimmed  = false;
+            restore   = s_brightness;
+        }
+        xSemaphoreGive(s_lock);
+    } else {
+        /* 拿不到锁时按无锁路径处理：s_dimmed 是 bool，单字节写不会撕裂 */
+        was_dimmed = s_dimmed;
+        s_dimmed   = false;
+        restore    = s_brightness;
+    }
+
+    /* 没在息屏：不动背光也不动壁纸，保持幂等 */
+    if (!was_dimmed) {
+        return;
+    }
+
+    /* 先隐藏壁纸再抬背光：避免 30% 的图在亮起来的一瞬间闪一下 */
+    ui_screensaver_hide();
+    bsp_display_brightness_set(restore);
+    wall_sd_prime();
 }
