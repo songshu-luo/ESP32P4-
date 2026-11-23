@@ -39,6 +39,7 @@ static int               s_brightness = APP_SETTINGS_DEFAULT_BRIGHTNESS;
 static uint32_t          s_dim_timeout_ms;
 static bool              s_dimmed;
 static uint32_t          s_last_inactive;   /* 上一拍的 inactive 值 */
+static uint32_t          s_rotate_next_ms;  /* 下次轮播的时刻（lv_tick_get 的 ms） */
 
 /* 字模收集提示 —— 不要删！
  *
@@ -75,7 +76,7 @@ esp_err_t app_settings_init(void)
         return ESP_ERR_TIMEOUT;
     }
     s_brightness      = APP_SETTINGS_DEFAULT_BRIGHTNESS;
-    s_dim_timeout_ms  = 0;      /* 默认常亮 */
+    s_dim_timeout_ms  = 300000;  /* 默认 5 分钟（0 才是常亮） */
     s_dimmed          = false;
     s_last_inactive   = 0;
     xSemaphoreGive(s_lock);
@@ -187,6 +188,7 @@ void app_settings_tick(void)
 
     bool    dim     = false;
     bool    wake    = false;
+    bool    rotate  = false;
     int     restore = APP_SETTINGS_DEFAULT_BRIGHTNESS;
     uint32_t timeout = 0;
 
@@ -207,11 +209,19 @@ void app_settings_tick(void)
     if (!s_dimmed && timeout > 0 && inactive >= timeout) {
         s_dimmed = true;
         dim = true;
+        /* 进入息屏：第一张从这一拍起算，至少完整显示一个轮播周期 */
+        if (APP_SETTINGS_SLEEP_ROTATE_MS > 0) {
+            s_rotate_next_ms = lv_tick_get() + APP_SETTINGS_SLEEP_ROTATE_MS;
+        }
     } else if (s_dimmed && activity) {
         s_dimmed = false;
         wake = true;
         restore = s_brightness;
+        /* 已不是息屏状态，轮播计时作废；下次进息屏会重新设 */
+        s_rotate_next_ms = 0;
     }
+    /* 锁内拷贝一份状态给锁外使用，避免无锁读 s_dimmed */
+    const bool dimmed_now = s_dimmed;
     xSemaphoreGive(s_lock);
 
     /* 硬件操作放在锁外，缩短临界区；LEDC 写入本身不阻塞 */
@@ -228,6 +238,27 @@ void app_settings_tick(void)
         bsp_display_brightness_set(restore);
         ui_screensaver_hide();
         wall_sd_prime();
+    }
+
+    /* 息屏中按间隔换下一张；唤醒 / 常亮状态什么都不做 */
+    if (APP_SETTINGS_SLEEP_ROTATE_MS > 0 && dimmed_now && ui_screensaver_is_visible()) {
+        const uint32_t now = lv_tick_get();
+        /* 有符号比较，处理 uint32 回绕（49 天） */
+        if ((int32_t)(now - s_rotate_next_ms) >= 0) {
+            rotate = true;
+            s_rotate_next_ms = now + APP_SETTINGS_SLEEP_ROTATE_MS;
+        }
+    }
+    if (rotate) {
+        const lv_image_dsc_t *wall = wall_sd_take_ready();
+        if (wall != NULL) {
+            /* 已在 LVGL 锁内；走交叉淡入。prime 不在此处调用，统一由淡入
+             * 完成回调触发——淡入期间预解码会覆写仍在显示的旧缓冲而撕裂。 */
+            ui_screensaver_transition_to(wall);
+        } else {
+            /* 没有就绪图：本轮不进入淡入，照旧预解码下一张，下个周期再试 */
+            wall_sd_prime();
+        }
     }
 }
 
@@ -254,6 +285,9 @@ void app_settings_wake_now(void)
     if (!was_dimmed) {
         return;
     }
+
+    /* 同步唤醒路径不走 tick，这里也要把轮播计时清掉，与 tick 的 wake 分支一致 */
+    s_rotate_next_ms = 0;
 
     /* 先隐藏壁纸再抬背光：避免 30% 的图在亮起来的一瞬间闪一下 */
     ui_screensaver_hide();

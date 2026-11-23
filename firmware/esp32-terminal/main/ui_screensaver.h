@@ -27,6 +27,10 @@ void ui_screensaver_show(void);
 /* 切换壁纸图源；dsc 为 NULL 时回落内置 sleep_wall。必须在 LVGL 锁内调用。 */
 void ui_screensaver_set_src(const lv_image_dsc_t *dsc);
 
+/* 带 300 ms 交叉淡入切换壁纸；动画进行中再次调用不会叠加第二段动画。
+ * dsc 为 NULL 或未初始化时回落硬切到底图。必须在 LVGL 锁内调用。 */
+void ui_screensaver_transition_to(const lv_image_dsc_t *dsc);
+
 /* 隐藏休眠壁纸（唤醒 / 切常亮分支调用） */
 void ui_screensaver_hide(void);
 

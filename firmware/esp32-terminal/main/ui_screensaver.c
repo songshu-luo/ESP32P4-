@@ -6,35 +6,140 @@
  * 只在 LV_EVENT_PRESSED 里调用 app_settings_wake_now() 立即唤醒。
  * 这样触摸不会穿透到底层页面（避免休眠中被误点滑块或切换页签），
  * 唤醒也不依赖 500 ms 的 inactive 轮询，按下即恢复。
- * 其它约束：只操作自己这一个对象，不清屏、不重建页面、不动 status bar；
+ *
+ * 图层结构（均挂在 s_root 之下，创建顺序即 z 序，时钟永远最上）：
+ *   s_root  全屏透明容器，唯一可点击，PRESSED 触发唤醒，吞掉所有触摸
+ *   s_wall  底图 lv_image，显示当前壁纸
+ *   s_wall2 overlay lv_image，交叉淡入时承载新图，默认隐藏
+ *   s_clock 时钟 label，透明不可点击
+ *
+ * 轮播切换走 300 ms 交叉淡入：新图先挂到 s_wall2 从全透明淡到不透明，
+ * 动画结束再把新图落到 s_wall、收起 overlay。淡入期间不预解码下一张，
+ * 避免后台覆写仍在显示的旧缓冲造成撕裂。
  * 图片 1024x600 与屏幕同分辨率，左上角对齐铺满，不变形。
  */
 
 #include "ui_screensaver.h"
 
+#include <stdio.h>
+#include <time.h>
+
 #include "lvgl.h"
 
 #include "app_settings.h"
+#include "wall_sd.h"
 #include "assets/sleep_wall.h"
 
 #define SCREEN_W   1024
 #define SCREEN_H   600
 
-static lv_obj_t *s_wall    = NULL;
-static bool      s_visible = false;
+#define CLOCK_TOP_Y        88                    /* 状态栏 56 之下，视觉中间偏上 */
+#define CLOCK_VALID_EPOCH  ((time_t)1700000000)  /* 早于 2023-11 视为未对时 */
+#define APP_UI_FADE_MS     300                   /* 壁纸交叉淡入时长（毫秒） */
 
-/* 按下即唤醒：壁纸层吞掉事件，不向页面传递 */
-static void wall_pressed_cb(lv_event_t *e)
+static lv_obj_t  *s_root       = NULL;
+static lv_obj_t  *s_wall       = NULL;
+static lv_obj_t  *s_wall2      = NULL;
+static lv_obj_t  *s_clock      = NULL;
+static lv_timer_t *s_clock_tmr = NULL;
+static int        s_last_min   = -1;   /* 上次渲染的分钟；-1 = 尚未有效对时 */
+
+static bool       s_visible    = false;
+static bool       s_fading     = false;                 /* overlay 淡入动画进行中 */
+static const lv_image_dsc_t *s_pending_dsc = NULL;      /* 待落到 s_wall 的新图 */
+
+/* 按下即唤醒：root 容器吞掉事件，不向页面传递 */
+static void root_pressed_cb(lv_event_t *e)
 {
     (void)e;
     app_settings_wake_now();
+}
+
+/* LVGL 9 的 anim exec_cb 签名是 (void *, int32_t)，与 lv_obj_set_style_opa
+ * 的 (lv_obj_t *, lv_opa_t, selector) 不匹配，这里用包装函数做类型转换。 */
+static void fade_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
+/* 淡入结束：把新图落到底图，收起 overlay，再预解码下一张。 */
+static void fade_done_cb(lv_anim_t *anim)
+{
+    (void)anim;
+
+    if (s_wall != NULL) {
+        lv_image_set_src(s_wall, s_pending_dsc ? s_pending_dsc : &sleep_wall);
+    }
+    if (s_wall2 != NULL) {
+        lv_obj_set_style_opa(s_wall2, LV_OPA_COVER, 0);
+        lv_obj_set_hidden(s_wall2, true);
+    }
+    s_pending_dsc = NULL;
+    s_fading = false;
+
+    /* 此刻旧缓冲已不在屏上显示，预解码下一张才不会撕裂当前画面 */
+    wall_sd_prime();
+}
+
+/* 只在分钟变化（或 force）时真正 set_text，避免每秒一次无谓的重排与重绘。
+ * 未对时（SNTP 未同步，time() 从 1970 起算）显示占位 "--:--"。 */
+static void clock_refresh(bool force)
+{
+    if (s_clock == NULL) {
+        return;
+    }
+
+    const time_t now = time(NULL);
+    if (now < CLOCK_VALID_EPOCH) {
+        if (force || s_last_min != -1) {
+            lv_label_set_text(s_clock, "--:--");
+            lv_obj_set_style_text_color(s_clock, lv_color_hex(0x8A8F98), 0);
+            s_last_min = -1;
+        }
+        return;
+    }
+
+    struct tm t;
+    localtime_r(&now, &t);          /* 时区已由 main.c 的 setenv(TZ)/tzset() 定好 */
+    if (!force && t.tm_min == s_last_min) {
+        return;                     /* 一分钟只重绘一次 */
+    }
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%02d:%02d", t.tm_hour, t.tm_min);
+    lv_label_set_text(s_clock, buf);
+    lv_obj_set_style_text_color(s_clock, lv_color_white(), 0);
+    s_last_min = t.tm_min;
+}
+
+static void clock_timer_cb(lv_timer_t *tmr)
+{
+    (void)tmr;
+    if (!s_visible) {
+        return;                     /* 亮屏时不刷新，省一点 */
+    }
+    clock_refresh(false);
 }
 
 void ui_screensaver_init(void)
 {
     lv_obj_t *layer = lv_layer_top();
 
-    s_wall = lv_image_create(layer);
+    /* 根容器：透明、不可滚动，唯一负责吞触摸并唤醒 */
+    s_root = lv_obj_create(layer);
+    lv_obj_set_size(s_root, SCREEN_W, SCREEN_H);
+    lv_obj_align(s_root, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_opa(s_root, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(s_root, 0, 0);
+    lv_obj_set_style_shadow_width(s_root, 0, 0);
+    lv_obj_set_style_radius(s_root, 0, 0);
+    lv_obj_set_style_pad_all(s_root, 0, 0);
+    lv_obj_set_clickable(s_root, true);
+    lv_obj_set_scrollable(s_root, false);
+    lv_obj_add_event_cb(s_root, root_pressed_cb, LV_EVENT_PRESSED, NULL);
+
+    /* 底图：兜底纯黑背景，不可点击 */
+    s_wall = lv_image_create(s_root);
     lv_image_set_src(s_wall, &sleep_wall);
     lv_obj_set_size(s_wall, SCREEN_W, SCREEN_H);
     lv_obj_align(s_wall, LV_ALIGN_TOP_LEFT, 0, 0);
@@ -42,28 +147,64 @@ void ui_screensaver_init(void)
     /* 兜底纯黑背景：RGB565 图片本身不透明，背景只在边界对不齐时露出 */
     lv_obj_set_style_bg_color(s_wall, lv_color_black(), LV_PART_MAIN);
     lv_obj_set_style_bg_opa(s_wall, LV_OPA_COVER, LV_PART_MAIN);
-
-    /* 关键：可点击但只负责唤醒。LVGL 命中测试只把事件交给最上层可点击
-     * 对象，因此下层页面收不到触摸；本层不响应任何控件动作，也不滚动。 */
-    lv_obj_set_clickable(s_wall, true);
+    lv_obj_set_clickable(s_wall, false);
     lv_obj_set_scrollable(s_wall, false);
-    lv_obj_add_event_cb(s_wall, wall_pressed_cb, LV_EVENT_PRESSED, NULL);
+
+    /* overlay：只引用 wall_sd 已解码好的像素缓冲，不额外分配 / 复制帧；
+     * 默认隐藏，样式不透明度为全不透明，仅在淡入动画期间被改到 0。 */
+    s_wall2 = lv_image_create(s_root);
+    lv_obj_set_size(s_wall2, SCREEN_W, SCREEN_H);
+    lv_obj_align(s_wall2, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_opa(s_wall2, LV_OPA_COVER, 0);
+    lv_obj_set_clickable(s_wall2, false);
+    lv_obj_set_scrollable(s_wall2, false);
+    lv_obj_set_hidden(s_wall2, true);
+
+    /* 透明时钟：label 自身无背景、无边框，只有文字（数字之外全透明）。
+     * 最后创建，保证 z 序永远在两张壁纸之上。 */
+    s_clock = lv_label_create(s_root);
+    lv_label_set_text(s_clock, "--:--");
+    lv_obj_set_style_text_font(s_clock, &lv_font_montserrat_36, 0);
+    lv_obj_set_style_text_color(s_clock, lv_color_white(), 0);
+    lv_obj_set_style_text_opa(s_clock, LV_OPA_90, 0);
+    lv_obj_set_style_bg_opa(s_clock, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_clock, 0, 0);
+    lv_obj_set_style_pad_all(s_clock, 0, 0);
+    lv_obj_align(s_clock, LV_ALIGN_TOP_MID, 0, CLOCK_TOP_Y);
+    /* 不可点击：触摸从 label 冒泡到父对象 s_root，由 s_root 的 PRESSED 唤醒 */
+    lv_obj_set_clickable(s_clock, false);
+
+    s_clock_tmr = lv_timer_create(clock_timer_cb, 1000, NULL);
 
     /* 默认隐藏 */
-    lv_obj_set_hidden(s_wall, true);
+    lv_obj_set_hidden(s_root, true);
 
     s_visible = false;
+    s_fading = false;
+    s_pending_dsc = NULL;
 }
 
 void ui_screensaver_show(void)
 {
-    if (s_wall == NULL) {
+    if (s_root == NULL) {
         return;
     }
-    lv_obj_set_hidden(s_wall, false);
+
+    /* 兜底复位：上次隐藏时若 overlay 没收干净，这里一并清掉，避免残留半透明。 */
+    if (s_wall2 != NULL) {
+        lv_anim_delete(s_wall2, NULL);
+        lv_obj_set_style_opa(s_wall2, LV_OPA_COVER, 0);
+        lv_obj_set_hidden(s_wall2, true);
+    }
+    s_pending_dsc = NULL;
+    s_fading = false;
+
+    lv_obj_set_hidden(s_root, false);
     /* 置顶只调整兄弟节点间的 z 序，不触碰 clickable / scrollable */
-    lv_obj_move_foreground(s_wall);
+    lv_obj_move_foreground(s_root);
     s_visible = true;
+    /* 强制刷一次，避免显示出上一次残留的旧分钟 */
+    clock_refresh(true);
 }
 
 void ui_screensaver_set_src(const lv_image_dsc_t *dsc)
@@ -74,12 +215,59 @@ void ui_screensaver_set_src(const lv_image_dsc_t *dsc)
     lv_image_set_src(s_wall, dsc ? dsc : &sleep_wall);
 }
 
-void ui_screensaver_hide(void)
+void ui_screensaver_transition_to(const lv_image_dsc_t *dsc)
 {
-    if (s_wall == NULL) {
+    /* 空图源 / 未初始化 / 动画进行中：都不叠加第二段动画，直接落到底图。 */
+    if (dsc == NULL || s_root == NULL || s_wall2 == NULL || s_fading) {
+        ui_screensaver_set_src(dsc);
         return;
     }
-    lv_obj_set_hidden(s_wall, true);
+
+    s_pending_dsc = dsc;
+    lv_image_set_src(s_wall2, dsc);
+    lv_obj_set_hidden(s_wall2, false);
+    lv_obj_set_style_opa(s_wall2, LV_OPA_TRANSP, 0);
+
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, s_wall2);
+    lv_anim_set_exec_cb(&a, fade_opa_cb);
+    lv_anim_set_values(&a, 0, LV_OPA_COVER);
+    lv_anim_set_time(&a, APP_UI_FADE_MS);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_set_completed_cb(&a, fade_done_cb);
+    lv_anim_start(&a);
+
+    s_fading = true;
+}
+
+void ui_screensaver_hide(void)
+{
+    if (s_root == NULL) {
+        return;
+    }
+
+    /* 先停掉尚未完成的 overlay 动画，避免回调在隐藏后再改样式。 */
+    if (s_wall2 != NULL) {
+        lv_anim_delete(s_wall2, NULL);
+    }
+
+    if (s_fading) {
+        /* 动画被打断：把还没落地的 pending 先落到底图（pending 为空则跳过），
+         * 否则下次显示会看到 overlay 上残留的半透明新图。 */
+        if (s_pending_dsc != NULL && s_wall != NULL) {
+            lv_image_set_src(s_wall, s_pending_dsc);
+        }
+    }
+
+    if (s_wall2 != NULL) {
+        lv_obj_set_style_opa(s_wall2, LV_OPA_COVER, 0);
+        lv_obj_set_hidden(s_wall2, true);
+    }
+    s_pending_dsc = NULL;
+    s_fading = false;
+
+    lv_obj_set_hidden(s_root, true);
     s_visible = false;
 }
 

@@ -26,6 +26,9 @@
 /** 息屏时的背光（%）。不用 0：全黑会被当成死机，30% 配合休眠壁纸仍能看见提示 */
 #define APP_SETTINGS_DIM_BRIGHTNESS       (30)
 
+/* 休眠壁纸自动轮播间隔（毫秒）。0 = 关闭轮播，只显示进入息屏时那一张 */
+#define APP_SETTINGS_SLEEP_ROTATE_MS      (180000)
+
 /**
  * @brief 初始化设置模块（创建互斥量、恢复默认值）
  *
