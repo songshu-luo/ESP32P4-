@@ -62,6 +62,22 @@ bool app_settings_is_dimmed(void);
 void app_settings_wake_now(void);
 
 /**
+ * @brief 立即进入息屏（不受超时设置影响）；已在息屏时幂等，返回 false
+ *
+ * 供设置页「息屏」按钮调用。与 tick 的自动进息屏分支完全一致：
+ * 降背光、显示休眠壁纸、取一张就绪的 SD 图换源，但不在这里预解码。
+ */
+bool app_settings_sleep_now(void);
+
+/**
+ * @brief 休眠中手动切下一张壁纸
+ *
+ * 不在息屏状态返回 false；无就绪图时触发预解码并返回 false，
+ * 本次点击不出图，下一次再按即可切换。
+ */
+bool app_settings_sleep_advance(void);
+
+/**
  * @brief 由 UI 的 500 ms 定时器调用
  *
  * 逻辑见 app_settings.c：超过 timeout 没有触摸就显示休眠壁纸并把背光降到

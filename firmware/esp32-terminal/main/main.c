@@ -27,6 +27,7 @@
 
 #include "app_settings.h"
 #include "app_ui.h"
+#include "background.h"
 #include "ui_screensaver.h"
 #include "wall_sd.h"
 #include "device_metrics.h"
@@ -135,6 +136,17 @@ void app_main(void)
 
     /* 放在解锁后，避免 init 里的 SD 挂载/解码长时间占着 LVGL 锁 */
     wall_sd_init();
+
+    /* 主界面背景图：wall_sd_init() 已经把 SD 挂好，这里只读 /sdcard/bg.jpg。
+     * 失败（没卡 / 没图 / 解码失败）不致命，背景层保持纯色底。 */
+    background_init();
+
+    /* UI 是在 SD 挂载之前建好的，那时 background_dsc() 还是 NULL；
+     * 解码完成后在锁内把图补挂到背景层上。 */
+    if (bsp_display_lock(0)) {
+        app_ui_background_refresh();
+        bsp_display_unlock();
+    }
 
     /* 触摸句柄自检：TAP ME 能响应说明触摸驱动已工作，
      * 这里只把句柄是否被 BSP 记录下来打到日志，便于排查。 */

@@ -134,6 +134,14 @@ static void dim_button_cb(lv_event_t *e)
     update_dim_buttons();
 }
 
+/* 「息屏」按钮：立刻息屏（不受右侧超时设置影响）。
+ * 屏保会盖住整屏，这里不做任何页面刷新。 */
+static void sleep_now_cb(lv_event_t *e)
+{
+    (void)e;
+    app_settings_sleep_now();
+}
+
 /* ---------------------------------------------------------------- 卡 A：显示 */
 
 static void build_display_card(lv_obj_t *parent)
@@ -163,9 +171,24 @@ static void build_display_card(lv_obj_t *parent)
     lv_obj_set_width(s_lbl_percent, 80);
     lv_obj_set_style_text_align(s_lbl_percent, LV_TEXT_ALIGN_RIGHT, 0);
 
-    /* -------- 第二行：息屏 -------- */
-    lv_obj_t *cap2 = ui_label(card, &lv_font_cjk_16, COLOR_MUTED, "息屏");
-    lv_obj_set_pos(cap2, 0, 96);
+    /* -------- 第二行：息屏（原地改成可点击按钮，位置沿用原 cap2） -------- */
+    lv_obj_t *btn_sleep = lv_button_create(card);
+    lv_obj_set_pos(btn_sleep, 0, 92);
+    lv_obj_set_size(btn_sleep, 72, 32);          /* 0 + 72 = 72 < 88，不与「30 秒」重叠 */
+    lv_obj_set_style_radius(btn_sleep, 8, 0);
+    lv_obj_set_style_bg_color(btn_sleep, COLOR_BAR, 0);
+    lv_obj_set_style_bg_opa(btn_sleep, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(btn_sleep, 1, 0);       /* 1px 描边：明确是可按的按钮 */
+    lv_obj_set_style_border_color(btn_sleep, COLOR_MUTED, 0);
+    lv_obj_set_style_shadow_width(btn_sleep, 0, 0);
+    lv_obj_set_style_outline_width(btn_sleep, 0, 0);
+    lv_obj_set_style_pad_all(btn_sleep, 0, 0);
+
+    lv_obj_t *lbl_sleep = ui_label(btn_sleep, &lv_font_cjk_16, COLOR_TEXT, "息屏");
+    lv_obj_center(lbl_sleep);
+    lv_obj_set_clickable(lbl_sleep, false);      /* 点击交给按钮 */
+
+    lv_obj_add_event_cb(btn_sleep, sleep_now_cb, LV_EVENT_CLICKED, NULL);
 
     /* 4 个息屏按钮。规格给的 x 序列 88/196/304/412 + 100 px 宽、8 px 间距，
      * 第 4 个的右边缘会落到内容区 x=512（内容区只有 448 宽），「常亮」按钮

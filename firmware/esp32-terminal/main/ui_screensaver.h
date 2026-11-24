@@ -24,7 +24,8 @@ void ui_screensaver_init(void);
 /* 显示休眠壁纸（息屏变暗分支调用） */
 void ui_screensaver_show(void);
 
-/* 切换壁纸图源；dsc 为 NULL 时回落内置 sleep_wall。必须在 LVGL 锁内调用。 */
+/* 切换壁纸图源；dsc 为 NULL 时清空图源（纯黑底 + 「请插入 SD 卡」提示）。
+ * 内置壁纸已移除，不再有兜底图片。必须在 LVGL 锁内调用。 */
 void ui_screensaver_set_src(const lv_image_dsc_t *dsc);
 
 /* 带 300 ms 交叉淡入切换壁纸；动画进行中再次调用不会叠加第二段动画。

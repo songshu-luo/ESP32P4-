@@ -29,6 +29,7 @@
 #include <stdio.h>
 
 #include "app_settings.h"
+#include "background.h"
 #include "device_registry.h"
 #include "device_status.h"
 #include "mqtt_link.h"
@@ -85,16 +86,150 @@ bool ui_format_bytes_pair(char *buf, size_t len, double used, double total)
     return true;
 }
 
+/* ---------------------------------------------------------------- 玻璃卡片 */
+
+/* 卡片登记表：滑动开始时统一把它们变实、滑动结束后统一淡回半透明。
+ * 页面一次性建好，当前共 18 张（总览 6 + 监控 7 + 设置 5），24 留点余量。 */
+#define UI_CARD_MAX (24)
+
+static lv_obj_t *s_cards[UI_CARD_MAX];
+static int s_card_cnt = 0;
+
+/* 页面构建完成前不响应滚动事件：build_pages() 末尾的 set_active(0, OFF)
+ * 也会同步走一遍 SCROLL_BEGIN/END，不拦住的话开机瞬间卡片会闪一下全实。 */
+static bool s_cards_live = false;
+
+/* 滚动结束后的「确认停稳」定时器：tabview 在 SCROLL_END 里还会启动
+ * 吸附/惯性动画，而且 indev 发 SCROLL_END 时 scroll_obj 尚未清空，
+ * lv_obj_is_scrolling() 当场看会一直是 true。这里等 40 ms 再看一次，
+ * 真停了才淡回 183，避免在吸附动画里做 alpha 混合。 */
+static lv_timer_t *s_fade_tmr = NULL;
+
+/* LVGL 9 的动画 exec 签名是 (void *, int32_t)，不能直接挂
+ * lv_obj_set_style_bg_opa，这里包一层。 */
+static void card_opa_anim_cb(void *var, int32_t value)
+{
+    lv_obj_set_style_bg_opa((lv_obj_t *)var, (lv_opa_t)value, 0);
+}
+
+/* 立即把所有卡片设成同一不透明度：滑动开始时用，瞬时设置比动画省事，
+ * 也避免「手指已经在拖、卡片还在渐变」的混合开销。 */
+static void cards_set_opa_instant(lv_opa_t opa)
+{
+    for (int i = 0; i < s_card_cnt; i++) {
+        if (s_cards[i] == NULL) {
+            continue;
+        }
+        /* 幂等：BEGIN / END 可能连续触发，先停掉这张卡上未完成的淡入动画。
+         * 只删自己挂的 exec_cb，别误伤卡片上其它动画。 */
+        lv_anim_delete(s_cards[i], card_opa_anim_cb);
+        lv_obj_set_style_bg_opa(s_cards[i], opa, 0);
+    }
+}
+
+/* 120 ms 内把卡片动画回半透明（滑动结束时用）。
+ * 起点取卡片当前的不透明度而不是写死 255：tabview 吸附动画结束时
+ * 会再发一次 SCROLL_END，那时卡片通常已经是 183，若强行从 255 重新
+ * 淡入会看到一次「突然变亮再暗下去」的闪烁。正常路径（BEGIN 刚把
+ * 它设成 255）仍然是 255 → 183。 */
+static void cards_fade_to(lv_opa_t opa)
+{
+    for (int i = 0; i < s_card_cnt; i++) {
+        lv_obj_t *card = s_cards[i];
+        if (card == NULL) {
+            continue;
+        }
+        /* 幂等：SCROLL_END 可能连续触发，重复启动前先删掉旧动画 */
+        lv_anim_delete(card, card_opa_anim_cb);
+
+        const lv_opa_t cur = lv_obj_get_style_bg_opa(card, 0);
+        if (cur == opa) {
+            continue;
+        }
+
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, card);
+        lv_anim_set_values(&a, (int32_t)cur, (int32_t)opa);
+        lv_anim_set_duration(&a, 120);
+        lv_anim_set_exec_cb(&a, card_opa_anim_cb);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_out);
+        lv_anim_start(&a);
+    }
+}
+
+/* 40 ms 轮询一次：等滚动 / tabview 吸附动画真正停下，再把卡片淡回
+ * 半透明。lv_obj_is_scrolling() 在 indev 刚发 SCROLL_END 的那一刻仍为
+ * true（scroll_obj 还没清空），当场判断会把淡回永远挡掉。 */
+static void fade_check_cb(lv_timer_t *timer)
+{
+    lv_obj_t *cont = (lv_obj_t *)lv_timer_get_user_data(timer);
+    if (cont == NULL || lv_obj_is_scrolling(cont)) {
+        return;     /* 还在动：保持不透明，下个周期再看 */
+    }
+    cards_fade_to(183);
+    lv_timer_pause(timer);
+}
+
+/**
+ * 滑动开始：卡片变实（255）。
+ *
+ * 这两个事件是 tabview 的 content（真正滚动的对象）发出的，不是 tv；
+ * 回调里用 lv_event_get_target(e) 现取事件对象，不缓存静态 tv，
+ * 避免页面重建后回调还指着旧对象。
+ */
+static void pages_scroll_begin_cb(lv_event_t *e)
+{
+    if (!s_cards_live) {
+        return;
+    }
+    lv_obj_t *scroll_obj = lv_event_get_target(e);
+    if (scroll_obj == NULL) {
+        return;
+    }
+    /* 新一轮滑动开始：先停掉上一轮的「停稳」检测 */
+    if (s_fade_tmr != NULL) {
+        lv_timer_pause(s_fade_tmr);
+    }
+    cards_set_opa_instant(LV_OPA_COVER);
+}
+
+/** 滑动结束：启动停稳检测，真停下后再用 120 ms 淡回 183（72%） */
+static void pages_scroll_end_cb(lv_event_t *e)
+{
+    if (!s_cards_live) {
+        return;
+    }
+    lv_obj_t *scroll_obj = lv_event_get_target(e);
+    if (scroll_obj == NULL) {
+        return;
+    }
+    if (s_fade_tmr != NULL) {
+        lv_timer_reset(s_fade_tmr);
+        lv_timer_resume(s_fade_tmr);
+    } else {
+        /* 理论上不会发生（定时器在 build_pages 里建好），兜底直接淡回 */
+        cards_fade_to(183);
+    }
+}
+
 lv_obj_t *ui_card(lv_obj_t *parent, int32_t w, int32_t h)
 {
     lv_obj_t *card = lv_obj_create(parent);
     lv_obj_remove_style_all(card);
     lv_obj_set_size(card, w, h);
     lv_obj_set_style_bg_color(card, COLOR_CARD, 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(card, 12, 0);
+    lv_obj_set_style_bg_opa(card, 183, 0);                 /* 72% 半透明 */
+    lv_obj_set_style_radius(card, 14, 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_white(), 0);
+    lv_obj_set_style_border_opa(card, LV_OPA_10, 0);       /* 8%~10% 高光边 */
     lv_obj_set_style_pad_all(card, 16, 0);
     lv_obj_set_scrollable(card, false);
+
+    if (s_card_cnt < UI_CARD_MAX) {
+        s_cards[s_card_cnt++] = card;
+    }
     return card;
 }
 
@@ -125,7 +260,8 @@ static void build_status_bar(lv_obj_t *scr)
     lv_obj_set_pos(bar, 0, 0);
     lv_obj_set_size(bar, lv_pct(100), STATUS_BAR_H);
     lv_obj_set_style_bg_color(bar, COLOR_BAR, 0);
-    lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+    /* 80% 半透明：状态栏不在 content 内，滑动时不重绘，可以长期半透明 */
+    lv_obj_set_style_bg_opa(bar, LV_OPA_80, 0);
     lv_obj_set_scrollable(bar, false);
 
     s_ctx.lamp = lv_obj_create(bar);
@@ -177,8 +313,8 @@ static void build_pages(lv_obj_t *scr)
     lv_tabview_set_tab_bar_position(tv, LV_DIR_TOP);
     /* tab_pos 是 LV_DIR_TOP（属于 LV_DIR_VER），所以这里设的是高度 */
     lv_tabview_set_tab_bar_size(tv, TAB_BAR_H);
-    lv_obj_set_style_bg_color(tv, COLOR_BG, 0);
-    lv_obj_set_style_bg_opa(tv, LV_OPA_COVER, 0);
+    /* tv 本身透明：背景图在最底层，tv 不能盖一层不透明底 */
+    lv_obj_set_style_bg_opa(tv, LV_OPA_TRANSP, 0);
     lv_obj_set_style_radius(tv, 0, 0);
     lv_obj_add_event_cb(tv, tab_changed_cb, LV_EVENT_VALUE_CHANGED, NULL);
 
@@ -188,18 +324,32 @@ static void build_pages(lv_obj_t *scr)
     lv_obj_t *tab_bar = lv_tabview_get_tab_bar(tv);
     lv_obj_set_size(tab_bar, lv_pct(100), TAB_BAR_H);
     lv_obj_set_style_bg_color(tab_bar, COLOR_BAR, 0);
-    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_bg_opa(tab_bar, LV_OPA_80, 0);
     lv_obj_set_style_radius(tab_bar, 0, 0);
     lv_obj_set_style_border_width(tab_bar, 0, 0);
     lv_obj_set_style_shadow_width(tab_bar, 0, 0);
     lv_obj_set_style_pad_all(tab_bar, 0, 0);
     lv_obj_set_style_pad_column(tab_bar, 0, 0);
 
-    /* 内容容器：不留内边距和间距，页面自己按 1024x(600-56-56) 排版 */
+    /* 内容容器：不留内边距和间距，页面自己按 1024x(600-56-56) 排版；
+     * 透明才能让背景图透上来（页面本身已经 remove_style_all）。 */
     lv_obj_t *cont = lv_tabview_get_content(tv);
+    lv_obj_set_style_bg_opa(cont, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(cont, 0, 0);
     lv_obj_set_style_pad_row(cont, 0, 0);
     lv_obj_set_style_pad_column(cont, 0, 0);
+
+    /* 真正被拖动 / 惯性滚动的是 content，不是 tv：LVGL 9 的 tabview 把
+     * SCROLL_BEGIN / SCROLL_END 发给 content（tv 默认不冒泡事件），所以
+     * 两个回调挂在 content 上；回调里仍用 lv_event_get_target(e) 现取对象。 */
+    lv_obj_add_event_cb(cont, pages_scroll_begin_cb, LV_EVENT_SCROLL_BEGIN, NULL);
+    lv_obj_add_event_cb(cont, pages_scroll_end_cb, LV_EVENT_SCROLL_END, NULL);
+
+    /* 停稳检测定时器：默认暂停，SCROLL_END 之后才启动 */
+    s_fade_tmr = lv_timer_create(fade_check_cb, 40, cont);
+    if (s_fade_tmr != NULL) {
+        lv_timer_pause(s_fade_tmr);
+    }
 
     for (int i = 0; i < PAGE_COUNT; i++) {
         lv_obj_t *page = lv_tabview_add_tab(tv, PAGES[i].name);
@@ -222,7 +372,8 @@ static void build_pages(lv_obj_t *scr)
             lv_obj_set_style_text_color(btn, COLOR_MUTED, 0);
             lv_obj_set_style_text_color(btn, COLOR_ACCENT, LV_STATE_CHECKED);
             lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, 0);
-            lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, LV_STATE_CHECKED);
+            /* 选中态：60% 而非全不透明，背景图能透上来一点 */
+            lv_obj_set_style_bg_opa(btn, LV_OPA_60, LV_STATE_CHECKED);
             lv_obj_set_style_bg_color(btn, COLOR_CARD, LV_STATE_CHECKED);
         }
 
@@ -331,17 +482,84 @@ static void status_poll_cb(lv_timer_t *timer)
     app_settings_tick();
 }
 
+/* ---------------------------------------------------------------- 背景层 */
+
+/* 全屏背景层句柄。app_ui_build() 时 background_dsc() 通常还是 NULL
+ * （UI 在 wall_sd_init() 之前就建好了，SD 还没挂载），所以先留着句柄，
+ * 等 main.c 解码完成后用 app_ui_background_refresh() 补挂图。 */
+static lv_obj_t *s_bg_obj = NULL;
+
+/**
+ * 全屏背景图（/sdcard/bg.jpg 解码后由 background_dsc() 提供）。
+ *
+ * 它是 scr 的第一个子对象，再 move_background() 一次保证压在最底：
+ * 状态栏、tabview、页签栏都盖在它上面，滑动页面时只有 content 动，
+ * 这一层完全静止，不会被重复贴图。
+ *
+ * 没有图（没插卡 / 没 bg.jpg / 解码失败）时不设源，靠 bg_color + COVER
+ * 兜底成和改造前一样的纯色底。lv_image 本身不接收点击、不滚动，
+ * 不会干扰页面手势。
+ */
+static void build_background(lv_obj_t *scr)
+{
+    lv_obj_t *bg_obj = lv_image_create(scr);
+    lv_obj_set_size(bg_obj, 1024, 600);
+    lv_obj_align(bg_obj, LV_ALIGN_TOP_LEFT, 0, 0);
+    lv_obj_set_style_bg_color(bg_obj, COLOR_BG, 0);
+    lv_obj_set_style_bg_opa(bg_obj, LV_OPA_COVER, 0);
+    lv_obj_set_clickable(bg_obj, false);
+    lv_obj_set_scrollable(bg_obj, false);
+
+    const lv_image_dsc_t *bg = background_dsc();
+    if (bg != NULL) {
+        lv_image_set_src(bg_obj, bg);
+    }
+
+    lv_obj_move_background(bg_obj);
+    s_bg_obj = bg_obj;
+}
+
+void app_ui_background_refresh(void)
+{
+    if (s_bg_obj == NULL) {
+        return;
+    }
+    const lv_image_dsc_t *bg = background_dsc();
+    if (bg == NULL) {
+        /* 没图：保持纯色底，什么也不做 */
+        return;
+    }
+    lv_image_set_src(s_bg_obj, bg);
+    /* 设源会重算尺寸/重绘，再压回最底一次，防止以后有人插对象进来 */
+    lv_obj_move_background(s_bg_obj);
+}
+
 /* ---------------------------------------------------------------- 界面构建 */
 
 void app_ui_build(lv_display_t *disp)
 {
     lv_obj_t *scr = lv_display_get_screen_active(disp);
+    /* 旧界面（含 content）马上要被清掉，先把引用它的停稳定时器删掉 */
+    if (s_fade_tmr != NULL) {
+        lv_timer_delete(s_fade_tmr);
+        s_fade_tmr = NULL;
+    }
     lv_obj_clean(scr);
+    /* lv_obj_clean 已删掉旧卡片，登记表里的指针全部失效；重新构建时清零 */
+    s_card_cnt = 0;
+    s_cards_live = false;
     lv_obj_set_style_bg_color(scr, COLOR_BG, 0);
     lv_obj_remove_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
+    /* 背景层必须最先建、并且压在最底，后面的状态栏和 tabview 都盖在它上面 */
+    build_background(scr);
+
     build_status_bar(scr);
     build_pages(scr);
+
+    /* 页面（以及卡片登记表）到这里才是完整可用的，之后才允许滚动回调改不透明度；
+     * 否则 build_pages 末尾的 set_active(0, OFF) 会让卡片先闪一下全实再淡回。 */
+    s_cards_live = true;
 
     lv_timer_create(status_poll_cb, STATUS_POLL_PERIOD_MS, NULL);
 

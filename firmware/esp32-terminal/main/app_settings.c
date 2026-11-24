@@ -50,6 +50,25 @@ static const char k_settings_glyph_hint[] __attribute__((unused)) = "轻触唤�
 
 /* ------------------------------------------------------------ 内部工具 */
 
+/* 抑制下一拍 tick 的「回落即唤醒」判定。
+ *
+ * tick 的唤醒判定是「inactive 比上一拍回落」——任何触摸都会让 LVGL 把
+ * inactive 归零（lv_indev.c 里 state==PRESSED 就刷新 last_activity_time）。
+ * app_settings_sleep_now() / app_settings_sleep_advance() 都由点击直接触发，
+ * 那一刻 inactive 已被这次点击清零；不动的话下一拍 tick 会把这次点击当成
+ * 「用户想唤醒」，刚息屏就亮屏 / 切完图就亮屏。
+ *
+ * 不采用「把基线对齐到当前 inactive」的比较法：切图走 PRESSED，松手时的
+ * RELEASED 会再刷新一次 inactive，若 tick 恰落在松手后几毫秒内，仍会满足
+ * inactive < 基线而被误判。这里改为让紧接着的一拍整拍跳过 activity 判定，
+ * 只更新基线，之后一切照旧（真实触摸的回落照常唤醒）。 */
+static bool s_skip_activity_once = false;
+
+static void suppress_next_activity(void)
+{
+    s_skip_activity_once = true;
+}
+
 static int clamp_brightness(int percent)
 {
     if (percent < BRIGHTNESS_MIN) {
@@ -201,8 +220,11 @@ void app_settings_tick(void)
     /* 新输入会让 inactive 归零，所以「比上一拍更小」就说明有操作。
      * 这比固定窗口可靠：tick 被拖慢时窗口会漏判，回落检测不会。
      * 基线只在成功拿到锁后才更新：万一这一拍抢锁失败，下一拍仍能
-     * 相对旧基线看出回落，不会把一次触摸的唤醒信息丢掉。 */
-    const bool activity = (inactive < s_last_inactive);
+     * 相对旧基线看出回落，不会把一次触摸的唤醒信息丢掉。
+     * s_skip_activity_once 由本文件手动息屏/手动切图置位：那一拍只看基线、
+     * 不判唤醒，避免把「点按钮」当成唤醒信号。 */
+    const bool activity = !s_skip_activity_once && (inactive < s_last_inactive);
+    s_skip_activity_once = false;
     s_last_inactive = inactive;
 
     timeout = s_dim_timeout_ms;
@@ -293,4 +315,77 @@ void app_settings_wake_now(void)
     ui_screensaver_hide();
     bsp_display_brightness_set(restore);
     wall_sd_prime();
+}
+
+bool app_settings_sleep_now(void)
+{
+    bool enter = false;
+
+    if (s_lock == NULL) {
+        return false;
+    }
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return false;                       /* 拿不到锁就放弃，由用户再点一次 */
+    }
+    if (!s_dimmed) {
+        s_dimmed = true;
+        enter = true;
+        if (APP_SETTINGS_SLEEP_ROTATE_MS > 0) {
+            /* 与自动进息屏一致：第一张至少完整显示一个周期 */
+            s_rotate_next_ms = lv_tick_get() + APP_SETTINGS_SLEEP_ROTATE_MS;
+        }
+    }
+    xSemaphoreGive(s_lock);
+
+    if (!enter) {
+        return false;                       /* 已在息屏：幂等，不动画面/背光 */
+    }
+
+    /* 锁外做硬件与 UI，与 tick 的 dim 分支完全一致 */
+    bsp_display_brightness_set(APP_SETTINGS_DIM_BRIGHTNESS);
+    ui_screensaver_show();
+    const lv_image_dsc_t *wall = wall_sd_take_ready();
+    if (wall != NULL) {
+        ui_screensaver_set_src(wall);
+    }
+
+    /* 这次「点一下息屏」的触摸本身已把 inactive 归零：对齐基线，
+     * 否则下一次 tick 会把它误判成用户想唤醒，息屏立刻被打断。 */
+    suppress_next_activity();
+    return true;
+}
+
+bool app_settings_sleep_advance(void)
+{
+    bool dimmed = false;
+
+    if (s_lock != NULL && xSemaphoreTake(s_lock, 0) == pdTRUE) {
+        dimmed = s_dimmed;
+        xSemaphoreGive(s_lock);
+    } else {
+        dimmed = s_dimmed;                  /* 无锁路径：bool 单字节读，与既有写法一致 */
+    }
+
+    if (!dimmed || !ui_screensaver_is_visible()) {
+        return false;                       /* 不在休眠：按钮点击不该有副作用 */
+    }
+
+    /* 手动切图后重新计时，否则可能刚切完就撞上自动轮播到点 */
+    if (APP_SETTINGS_SLEEP_ROTATE_MS > 0) {
+        s_rotate_next_ms = lv_tick_get() + APP_SETTINGS_SLEEP_ROTATE_MS;
+    }
+
+    const lv_image_dsc_t *wall = wall_sd_take_ready();
+    if (wall != NULL) {
+        ui_screensaver_transition_to(wall); /* 走 300ms 交叉淡入，与自动轮播同一条路径 */
+        /* 切图这次触摸同样重置了 inactive，必须对齐基线，
+         * 否则下一拍 tick 会把它当成唤醒信号，点一下按钮就亮屏。 */
+        suppress_next_activity();
+        return true;
+    }
+
+    /* 还没解好：触发预解码，这次点击不出图，下一次再按就能切 */
+    suppress_next_activity();
+    wall_sd_prime();
+    return false;
 }
